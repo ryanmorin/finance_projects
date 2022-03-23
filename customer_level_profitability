@@ -1,0 +1,261 @@
+-- *****************
+-- customer support contact by customers by month
+-- *****************
+
+WITH cs_cstmr_contact AS
+(
+SELECT LAST_DAY(tysosla__first_touch__c) dt
+      ,a.name
+      ,vgs_organization_id__c
+      ,COUNT(a.name) num
+  FROM bi.sfdc_account_vw a 
+  LEFT JOIN bi.sfdc_case_vw c  ON c.accountid = a.id
+ WHERE tysosla__first_touch__c IS NOT NULL
+   AND vgs_organization_id__c  IS NOT NULL
+   AND vgs_organization_id__c  IN (SELECT ac_org_id 
+                                     FROM bi.vgs_organizations 
+                                    WHERE type = 'Customer') -- org's to include
+ GROUP BY LAST_DAY(tysosla__first_touch__c)
+       ,a.name
+       ,vgs_organization_id__c
+),
+
+cs_usage_matrix AS (
+SELECT z.dt
+      ,z.name
+      ,z.vgs_organization_id__c AS vgs_org_id
+      ,NVL(z.num / (NULLIF(SUM(z.num) OVER (PARTITION BY z.dt),0.00) * 1.00),0) AS pcnt_of_ttl
+  FROM cs_cstmr_contact z
+),
+
+-- ************************
+-- pulling the cs cost of goods from amalgamated transactions
+-- ************************
+
+cs_cogs_txns AS
+(
+[customer_support_costs]
+),
+
+-- allocating the cs costs to customers who used cs
+
+cs_usage_by_cstmr_by_mnth AS
+(
+SELECT s.dt
+      ,s.name
+      ,s.vgs_org_id AS ac_org_id
+      ,(s.pcnt_of_ttl * c.mnth_ttl) AS cstmr_sprt_$_alloc
+  FROM cs_cogs_txns c
+  JOIN cs_usage_matrix s
+    ON c.end_of_month = s.dt
+),
+
+-- ******************
+-- infrastructure cost allocation based on product revenue
+-- ******************
+
+prod_revenue_txns AS
+(
+SELECT end_of_month
+      ,ac_org_id
+      ,product_revenue
+   FROM
+--
+-- Presently revenue is sometimes being booked by customer.
+--
+[product_revenue_ex_discounts]
+),
+
+prod_rev_alloc AS
+(
+SELECT pr.end_of_month
+--      ,pr.entity
+      ,pr.ac_org_id
+      ,NULLIF(pr.product_revenue / NULLIF(SUM(pr.product_revenue) OVER (PARTITION BY pr.end_of_month),0.00) * 1.00, 0) AS pcnt_ttl
+  FROM prod_revenue_txns AS pr
+),
+
+infrastructure_cogs AS
+(
+[infrastructure_costs]
+),
+
+infrastructure_alloc AS
+(
+SELECT p.end_of_month
+      ,p.ac_org_id
+      ,p.pcnt_ttl * i.ttl AS infra_$_alloc
+  FROM prod_rev_alloc AS p
+  JOIN infrastructure_cogs AS i
+    ON p.end_of_month = i.end_of_month
+),
+
+-- *************************
+-- Customer Name
+-- there are multiple spellings of customers name's between QBO and NS - for consistency I've pulled name from SFDC
+-- *************************
+
+customer_names AS
+(
+SELECT name
+      ,vgs_organization_id__c AS ac_org_id
+  FROM bi.sfdc_account_vw
+ WHERE vgs_organization_id__c IS NOT NULL  
+  ),
+
+-- *************
+-- hosting costs
+-- *************
+
+aws_hosting_cost AS
+(
+SELECT d.c_yyyymm
+      ,SUM(h.amount) AS aws_amt
+  FROM gsheets.finance_metrics_hosting_allocation AS h
+  LEFT JOIN bi.date_dim d
+    ON d.thedate = h.for_period_ending
+ WHERE h.environment = 'production'
+   AND h.hosting_provider = 'aws'
+ GROUP BY d.c_yyyymm 
+),
+
+luminati_hosting_cost AS
+(
+SELECT d.c_yyyymm
+      ,SUM(h.amount) AS lum_amt
+  FROM gsheets.finance_metrics_hosting_allocation AS h
+  LEFT JOIN bi.date_dim d
+    ON d.thedate = h.for_period_ending
+ WHERE h.environment = 'production'
+   AND h.hosting_provider = 'luminati'
+ GROUP BY d.c_yyyymm 
+),
+
+equinix_hosting_cost AS
+(
+SELECT d.c_yyyymm
+      ,SUM(h.amount) AS eqn_amt
+  FROM gsheets.finance_metrics_hosting_allocation AS h
+  LEFT JOIN bi.date_dim d
+    ON d.thedate = h.for_period_ending
+ WHERE h.environment = 'production'
+   AND h.hosting_provider = 'equinix'
+ GROUP BY d.c_yyyymm 
+),
+
+hosting_alloc_matrix AS 
+(
+SELECT name
+      ,ac_org_id
+      ,c_yyyymm
+      ,NVL(total_ops/(NULLIF(SUM(total_ops) 
+         OVER (PARTITION BY c_yyyymm),0.00) * 1.00),0) AS cstmr_aws_pcnt
+      ,NVL(lum_stor_gb_total/(NULLIF(SUM(lum_stor_gb_total)
+         OVER (PARTITION BY c_yyyymm),0.00) * 1.00),0) AS cstmr_lum_pcnt
+  FROM
+  (
+   SELECT name
+         ,o.ac_org_id
+         ,c_yyyymm
+         ,SUM(total_operations)      AS total_ops
+         ,SUM(luminati_traffic_gb)   AS lum_stor_gb_total
+     FROM bi.vgs_vault_billable_usage u
+     JOIN bi.vgs_organizations        o
+       ON u.ac_org_id = o.ac_org_id
+    GROUP BY name
+            ,o.ac_org_id
+            ,c_yyyymm
+    )
+    WHERE LAST_DAY(TO_DATE(LEFT(c_yyyymm,4)+'-'+RIGHT(c_yyyymm,2)+'-01','YYYY-MM-DD')) > '2020-12-31'
+),
+
+prod_hosting_costs AS
+(
+SELECT --m.name
+      m.ac_org_id
+      ,LAST_DAY(TO_DATE(LEFT(m.c_yyyymm,4)+'-'+RIGHT(m.c_yyyymm,2)+'-01','YYYY-MM-DD')) AS end_of_month
+      ,cstmr_aws_pcnt * a.aws_amt          AS aws_$_allocation
+      ,cstmr_lum_pcnt * l.lum_amt          AS lum_$_allocation
+      ,CASE
+           WHEN m.ac_org_id IN ('ACh8JJTM42LYxwe2wfGQxwj5') THEN e.eqn_amt -- unit finance is presently the only user of equinix
+           ELSE 0
+        END AS eqn_$_allocation
+  FROM hosting_alloc_matrix m
+  LEFT JOIN aws_hosting_cost a
+    ON m.c_yyyymm = a.c_yyyymm
+  LEFT JOIN luminati_hosting_cost l
+    ON m.c_yyyymm = l.c_yyyymm
+  LEFT JOIN equinix_hosting_cost e
+    ON m.c_yyyymm = e.c_yyyymm 
+),
+
+-- *************************
+-- customer segment information
+-- *************************
+
+cstmr_segmnt AS
+(
+  [cstmr_sgmnt]
+)
+
+-- **************************
+-- combining it all together
+-- **************************
+
+SELECT COALESCE(s.dt, i.end_of_month, h.end_of_month) AS month_ended
+      ,COALESCE(s.ac_org_id, i.ac_org_id, h.ac_org_id) AS ac_org_id
+      ,n.name
+      ,COALESCE(c.classification,'SMB') AS cstmr_sgmnt
+      ,CASE
+           WHEN COALESCE(t.product_revenue * 12,0) BETWEEN 0 AND 5000 THEN '$0.00 - $5,000'
+           WHEN COALESCE(t.product_revenue * 12,0) BETWEEN 5001 AND 10000 THEN '$5,001 - $10,000'
+           WHEN COALESCE(t.product_revenue * 12,0) BETWEEN 10001 AND 50000 THEN '$10,001 - $50,000'
+           WHEN COALESCE(t.product_revenue * 12,0) BETWEEN 50001 AND 100000 THEN '$50,001 - $100,000'
+           WHEN COALESCE(t.product_revenue * 12,0) > 100000 THEN '$100,001+'
+           ELSE '$0.00 - $5,000'
+        END                                        AS arr_size_revnu
+
+      ,COALESCE(s.cstmr_sprt_$_alloc,0)            AS cstmr_sprt_$_alloc
+      ,COALESCE(h.aws_$_allocation,0)              AS aws_$_allocation
+      ,COALESCE(h.lum_$_allocation,0)              AS lum_$_allocation
+      ,COALESCE(h.eqn_$_allocation,0)              AS eqn_$_allocation
+      ,COALESCE(i.infra_$_alloc, 0)                AS infra_$_alloc
+
+      ,(COALESCE(s.cstmr_sprt_$_alloc,0) + 
+        COALESCE(h.aws_$_allocation,0) + 
+        COALESCE(h.lum_$_allocation,0) + 
+        COALESCE(h.eqn_$_allocation,0) + 
+        COALESCE(i.infra_$_alloc, 0))              AS ttl_cogs_by_customer 
+
+      ,COALESCE(t.product_revenue,0)               AS product_revenue
+
+      ,(
+        (t.product_revenue - 
+         COALESCE(s.cstmr_sprt_$_alloc,0) - 
+         COALESCE(h.aws_$_allocation,0) - 
+         COALESCE(h.lum_$_allocation,0) - 
+         COALESCE(h.eqn_$_allocation,0) - 
+         COALESCE(i.infra_$_alloc, 0)
+        ) / NULLIF(t.product_revenue,0))               AS gross_prcnt_mrgn
+
+      ,(
+        (t.product_revenue - 
+         COALESCE(s.cstmr_sprt_$_alloc,0) - 
+         COALESCE(h.aws_$_allocation,0) - 
+         COALESCE(h.lum_$_allocation,0) - 
+         COALESCE(h.eqn_$_allocation,0) - 
+         COALESCE(i.infra_$_alloc, 0)
+        ))                                             AS gross_dollar_mrgn
+
+  FROM cs_usage_by_cstmr_by_mnth s
+  FULL JOIN infrastructure_alloc i
+    ON s.dt = i.end_of_month AND s.ac_org_id = i.ac_org_id
+  FULL JOIN prod_hosting_costs   h
+    ON h.end_of_month = i.end_of_month AND h.ac_org_id = i.ac_org_id
+  FULL JOIN prod_revenue_txns    t
+    ON t.end_of_month = i.end_of_month AND t.ac_org_id = i.ac_org_id
+  LEFT JOIN cstmr_segmnt         c
+    ON h.ac_org_id = c.vgs_org_id
+  LEFT JOIN customer_names       n
+    ON t.ac_org_id = n.ac_org_id
+ WHERE i.end_of_month >= '2021-01-31' -- this is date the report begins
