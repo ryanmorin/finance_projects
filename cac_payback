@@ -18,8 +18,6 @@ sales_marketing_expenses AS (
    ORDER BY 1
   ),
 
--- sometimes revenue is being booked by customer. we need to use wilson's revenue subschedule till a new billing system has been integrated with NetSuite
-
 product_revenue AS (
   SELECT date_trunc('month', end_of_month)     AS txn_month
         ,SUM(product_revenue)                  AS month_total
