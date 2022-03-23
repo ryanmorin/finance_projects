@@ -1,0 +1,61 @@
+--***************
+--efficiency ratio and magic number
+--****************
+
+WITH arr AS (
+select LAST_DAY(TO_DATE(LEFT(period,4)+'-'+RIGHT(period,2)+'-01', 'YYYY-MM-DD')) AS end_of_month
+      ,ROUND(SUM(revenue) * 12,0) as arr
+from ([ledger_arr_data_model_snippet])
+group by period),
+
+txns AS (
+  SELECT LAST_DAY(TO_DATE(q.date, 'YYYY MM DD')) end_of_month
+       ,CASE
+            WHEN trim(account_num) ~ '^[0-9]' THEN trim(account_num)
+            ELSE NULL 
+         END::int AS account_num
+       ,CASE
+            WHEN class = ' ' THEN 'none'
+            ELSE class
+         END AS department
+       , amount
+
+FROM bi.qb_ledger_report q
+WHERE account_num <> ''
+  AND q.date <= '07-31-2021'
+),
+
+sm_expense AS (
+  SELECT date_trunc('month', end_of_month) AS txn_month
+        ,SUM(amount) AS month_total
+    FROM txns
+   WHERE account_num BETWEEN 6000 AND 9920 
+     AND department IN ('OPEX:Sales'
+                        ,'OPEX:Marketing'
+                        ,'OPEX:Business Development'
+                        ,'OPEX:Customer Success')
+   GROUP BY 1
+   ORDER BY 1
+),
+
+data as (
+SELECT LAST_DAY(s.txn_month) as end_of_month
+       ,SUM(s.month_total) OVER (
+         ORDER BY s.txn_month ASC rows BETWEEN 2 preceding AND CURRENT row) AS roll_sm_qtr
+       ,a.arr
+       ,LAG(a.arr,3) OVER (ORDER BY a.end_of_month) AS lag_arr
+
+FROM sm_expense s
+JOIN arr a
+  ON LAST_DAY(s.txn_month) = a.end_of_month)
+
+SELECT end_of_month
+       ,roll_sm_qtr
+       ,LAG(roll_sm_qtr,3) OVER (ORDER BY end_of_month)           AS lag_sm_qtr
+       ,arr
+       ,lag_arr
+       ,(arr - lag_arr) / roll_sm_qtr                             AS effncy_ratio
+       ,(arr - lag_arr) / LAG(roll_sm_qtr,3) OVER (
+         ORDER BY end_of_month)                                   AS magic_nmbr
+
+  FROM data
