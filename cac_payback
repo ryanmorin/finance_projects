@@ -1,0 +1,60 @@
+WITH txns AS (
+  SELECT calendar_date
+        ,parent_dept_name
+        ,net_amt
+    FROM core.fact_gl_transaction fgt
+    JOIN core.dim_date dd on dd.dim_date_id = fgt.dim_trans_date_id
+    JOIN core.dim_gl_account dga on dga.dim_gl_account_id = fgt.dim_gl_account_id
+    LEFT JOIN (select b.dim_department_id, a.department_name AS parent_dept_name from core.dim_department a, core.dim_department b where a.nk_department_id = b.parent_nk_department_id) par on par.dim_department_id = fgt.dim_department_id
+   WHERE gl_acct_number BETWEEN 6000 AND 9920
+  ),
+
+sales_marketing_expenses AS (
+  SELECT date_trunc('month', calendar_date) AS txn_month
+        ,SUM(net_amt)                       AS month_total
+    FROM txns
+   WHERE parent_dept_name IN ('Sales', 'Marketing')
+   GROUP BY 1
+   ORDER BY 1
+  ),
+
+-- sometimes revenue is being booked by customer. we need to use wilson's revenue subschedule till a new billing system has been integrated with NetSuite
+
+product_revenue AS (
+  SELECT date_trunc('month', end_of_month)     AS txn_month
+        ,SUM(product_revenue)                  AS month_total
+    FROM
+ ((SELECT LAST_DAY(dd.calendar_date) AS end_of_month
+        ,SUM(net_amt)            AS product_revenue
+    FROM core.fact_gl_transaction fgt
+    JOIN core.dim_date dd ON dd.dim_date_id = fgt.dim_trans_date_id
+    JOIN core.dim_data_source dds ON dds.dim_data_source_id = fgt.dim_data_source_id
+    JOIN core.dim_customer dc ON dc.dim_customer_id = fgt.dim_customer_id
+    JOIN core.dim_gl_account dga ON dga.dim_gl_account_id = fgt.dim_gl_account_id
+   WHERE ((gl_acct_number BETWEEN 4020 AND 4029) OR gl_acct_number IN (4033, 4036, 4038, 4039, 4080, 4090))
+     AND data_source_name = 'Netsuite GSheet Revenue'
+   GROUP BY LAST_DAY(dd.calendar_date)
+  HAVING SUM(net_amt) > 0)
+   UNION
+ (SELECT LAST_DAY(dd.calendar_date) AS end_of_month
+        ,SUM(net_amt)            AS product_revenue
+    FROM core.fact_gl_transaction fgt
+    JOIN core.dim_date dd ON dd.dim_date_id = fgt.dim_trans_date_id
+    JOIN core.dim_data_source dds ON dds.dim_data_source_id = fgt.dim_data_source_id
+    JOIN core.dim_customer dc ON dc.dim_customer_id = fgt.dim_customer_id
+    JOIN core.dim_gl_account dga ON dga.dim_gl_account_id = fgt.dim_gl_account_id
+   WHERE ((gl_acct_number BETWEEN 4020 AND 4029) OR gl_acct_number IN (4033, 4036, 4038, 4039, 4080, 4090))
+     AND data_source_name = 'Quickbooks'
+   GROUP BY LAST_DAY(dd.calendar_date)
+  HAVING SUM(net_amt) > 0))
+  GROUP BY date_trunc('month', end_of_month)
+ )
+
+  SELECT LAST_DAY(a.txn_month) AS end_of_month
+        ,SUM(a.month_total) OVER (ORDER BY a.txn_month ASC rows BETWEEN 11 preceding AND CURRENT row) AS rolling_sm_exp_12_mnths
+        ,b.month_total * 1 AS total_revenue
+        ,LAG(b.month_total * 1, 12) OVER (ORDER BY a.txn_month) AS lag_ttl_rev_12_mnths
+        ,SUM(a.month_total) OVER (ORDER BY a.txn_month ASC rows BETWEEN 11 preceding AND CURRENT row)/((b.month_total - NVL(LAG(b.month_total,12) OVER (ORDER BY a.txn_month),0)) * 12) AS cac_payback
+        ,SUM(a.month_total) OVER (ORDER BY a.txn_month ASC rows BETWEEN 11 preceding AND CURRENT row) / ((b.month_total - NVL(LAG(b.month_total,12) OVER (ORDER BY a.txn_month),0)) * 12) * 12 AS cac_pybk_mnths
+    FROM sales_marketing_expenses a
+    JOIN product_revenue b ON a.txn_month = b.txn_month
