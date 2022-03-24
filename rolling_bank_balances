@@ -1,23 +1,28 @@
-select dt
-      ,SUM(amt) over (order by dt ASC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)::DECIMAL as ttl
-from
-(
-(select LAST_DAY(transaction_date) as dt
-      ,sum(net_amt) as amt
-  from stg_netsuite.temp_amalgamated_trans tat
- where gl_account_num between 1000 and 1100
-   and data_source = 'qb_ledger_report'
-   and transaction_date < '2021-08-01'
-  group by 1)
---  order by 1 asc)
-UNION
-(select LAST_DAY(transaction_date) as dt
-      ,sum(net_amt) as amt
-  from stg_netsuite.temp_amalgamated_trans tat
- where gl_account_num between 1000 and 1100
-   and data_source = 'netsuite_expences'
-   and transaction_date > '2021-07-31'
-  group by 1)
---  order by 1 asc)
-  )
-  order by 1 ASC
+SELECT dt
+      ,SUM(bank_txns) OVER (order by dt ASC ROWS BETWEEN unbounded preceding AND CURRENT row):: decimal AS bank_balance
+  FROM (
+SELECT last_day(dd.calendar_date)     AS dt
+      ,SUM(net_amt)            AS bank_txns
+  FROM core.fact_gl_transaction fgt
+  JOIN core.dim_date dd ON dd.dim_date_id = fgt.dim_trans_date_id
+  JOIN core.dim_data_source dds ON dds.dim_data_source_id = fgt.dim_data_source_id
+  JOIN core.dim_customer dc ON dc.dim_customer_id = fgt.dim_customer_id
+  JOIN core.dim_gl_account dga ON dga.dim_gl_account_id = fgt.dim_gl_account_id
+ WHERE gl_acct_number BETWEEN 1000 AND 1100
+   AND data_source_name = 'Netsuite GSheet Expenses'
+   AND LAST_DAY(dd.calendar_date) > '2021-07-31'
+ GROUP BY 1
+ UNION
+SELECT last_day(dd.calendar_date)   AS dt
+      ,SUM(net_amt)            AS bank_txns
+  FROM core.fact_gl_transaction fgt
+  JOIN core.dim_date dd ON dd.dim_date_id = fgt.dim_trans_date_id
+  JOIN core.dim_data_source dds ON dds.dim_data_source_id = fgt.dim_data_source_id
+  JOIN core.dim_customer dc ON dc.dim_customer_id = fgt.dim_customer_id
+  JOIN core.dim_gl_account dga ON dga.dim_gl_account_id = fgt.dim_gl_account_id
+ WHERE gl_acct_number BETWEEN 1000 AND 1100
+   AND data_source_name IN ('Quickbooks','Netsuite - Gsheets Adjustments')
+   AND LAST_DAY(dd.calendar_date) < '2021-08-01'
+ GROUP BY 1
+)
+ ORDER BY 1 ASC
