@@ -1,0 +1,23 @@
+select dt
+      ,SUM(amt) over (order by dt ASC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)::DECIMAL as ttl
+from
+(
+(select LAST_DAY(transaction_date) as dt
+      ,sum(net_amt) as amt
+  from stg_netsuite.temp_amalgamated_trans tat
+ where gl_account_num between 1000 and 1100
+   and data_source = 'qb_ledger_report'
+   and transaction_date < '2021-08-01'
+  group by 1)
+--  order by 1 asc)
+UNION
+(select LAST_DAY(transaction_date) as dt
+      ,sum(net_amt) as amt
+  from stg_netsuite.temp_amalgamated_trans tat
+ where gl_account_num between 1000 and 1100
+   and data_source = 'netsuite_expences'
+   and transaction_date > '2021-07-31'
+  group by 1)
+--  order by 1 asc)
+  )
+  order by 1 ASC
