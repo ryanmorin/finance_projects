@@ -1,0 +1,43 @@
+WITH bank_balances AS (
+  [end_of_month_bank_balance]
+  ),
+
+equity_balances AS (
+  SELECT dt
+      ,SUM(equity_txns) OVER (order by dt ASC ROWS BETWEEN unbounded preceding AND CURRENT row):: decimal AS equity_balance
+  FROM (
+SELECT last_day(dd.calendar_date)     AS dt
+      ,SUM(net_amt)                   AS equity_txns
+  FROM core.fact_gl_transaction fgt
+  JOIN core.dim_date dd ON dd.dim_date_id = fgt.dim_trans_date_id
+  JOIN core.dim_data_source dds ON dds.dim_data_source_id = fgt.dim_data_source_id
+  JOIN core.dim_customer dc ON dc.dim_customer_id = fgt.dim_customer_id
+  JOIN core.dim_gl_account dga ON dga.dim_gl_account_id = fgt.dim_gl_account_id
+ WHERE gl_acct_number BETWEEN 3200 AND 3920 -- equity gls that exclude the retained earnings and net loss/gain
+   AND data_source_name = 'Netsuite GSheet Expenses'
+   AND LAST_DAY(dd.calendar_date) > '2021-07-31'
+ GROUP BY 1
+ UNION
+SELECT last_day(dd.calendar_date)     AS dt
+      ,SUM(net_amt)                   AS equity_txns
+  FROM core.fact_gl_transaction fgt
+  JOIN core.dim_date dd ON dd.dim_date_id = fgt.dim_trans_date_id
+  JOIN core.dim_data_source dds ON dds.dim_data_source_id = fgt.dim_data_source_id
+  JOIN core.dim_customer dc ON dc.dim_customer_id = fgt.dim_customer_id
+  JOIN core.dim_gl_account dga ON dga.dim_gl_account_id = fgt.dim_gl_account_id
+ WHERE gl_acct_number BETWEEN 3200 AND 3920 -- equity gls that exclude the retained earnings and net loss/gain
+   AND data_source_name IN ('Quickbooks')
+   AND LAST_DAY(dd.calendar_date) < '2021-08-01'
+ GROUP BY 1
+)
+ ORDER BY 1 ASC
+  )
+
+  SELECT b.dt
+        ,NVL(bank_balance - COALESCE(LAG(bank_balance) OVER (ORDER BY b.dt), 0),0)     AS change_in_cash
+        ,NVL(equity_balance - COALESCE(LAG(equity_balance) OVER (ORDER BY e.dt), 0),0) AS change_in_equity
+        ,(NVL(bank_balance - COALESCE(LAG(bank_balance) OVER (ORDER BY b.dt), 0),0) - NVL(equity_balance - COALESCE(LAG(equity_balance) OVER (ORDER BY e.dt), 0),0)) AS net_burn_rate
+  FROM bank_balances b
+  LEFT JOIN equity_balances e
+    ON b.dt = e.dt
+ ORDER BY b.dt ASC
