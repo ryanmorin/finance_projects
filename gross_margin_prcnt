@@ -1,0 +1,174 @@
+WITH service_revenue AS
+(
+SELECT LAST_DAY(dd.calendar_date) AS end_of_month
+      ,SUM(net_amt)            AS service_revenue
+  FROM core.fact_gl_transaction fgt
+  JOIN core.dim_date dd ON dd.dim_date_id = fgt.dim_trans_date_id
+  JOIN core.dim_data_source dds ON dds.dim_data_source_id = fgt.dim_data_source_id
+  JOIN core.dim_gl_account dga ON dga.dim_gl_account_id = fgt.dim_gl_account_id
+ WHERE gl_acct_number IN (4012,4013,4035,4041)
+   AND data_source_name = 'Netsuite GSheet Revenue'
+ GROUP BY LAST_DAY(dd.calendar_date)
+ UNION
+SELECT LAST_DAY(dd.calendar_date) AS end_of_month
+      ,SUM(net_amt)            AS service_revenue
+  FROM core.fact_gl_transaction fgt
+  JOIN core.dim_date dd ON dd.dim_date_id = fgt.dim_trans_date_id
+  JOIN core.dim_data_source dds ON dds.dim_data_source_id = fgt.dim_data_source_id
+  JOIN core.dim_gl_account dga ON dga.dim_gl_account_id = fgt.dim_gl_account_id
+ WHERE gl_acct_number IN (4012,4013,4035,4041)
+   AND data_source_name = 'Quickbooks'
+ GROUP BY LAST_DAY(dd.calendar_date)
+),
+
+product_revenue AS
+(
+SELECT LAST_DAY(dd.calendar_date) AS end_of_month
+      ,SUM(net_amt)            AS product_revenue
+  FROM core.fact_gl_transaction fgt
+  JOIN core.dim_date dd ON dd.dim_date_id = fgt.dim_trans_date_id
+  JOIN core.dim_data_source dds ON dds.dim_data_source_id = fgt.dim_data_source_id
+  JOIN core.dim_gl_account dga ON dga.dim_gl_account_id = fgt.dim_gl_account_id
+ WHERE ((gl_acct_number BETWEEN 4020 AND 4029) OR gl_acct_number IN (4033, 4036, 4038, 4039, 4080, 4090))
+   AND data_source_name = 'Netsuite GSheet Revenue'
+ GROUP BY LAST_DAY(dd.calendar_date)
+ UNION
+SELECT LAST_DAY(dd.calendar_date) AS end_of_month
+      ,SUM(net_amt)            AS product_revenue
+  FROM core.fact_gl_transaction fgt
+  JOIN core.dim_date dd ON dd.dim_date_id = fgt.dim_trans_date_id
+  JOIN core.dim_data_source dds ON dds.dim_data_source_id = fgt.dim_data_source_id
+  JOIN core.dim_gl_account dga ON dga.dim_gl_account_id = fgt.dim_gl_account_id
+   WHERE ((gl_acct_number BETWEEN 4020 AND 4029) OR gl_acct_number IN (4033, 4036, 4038, 4039, 4080, 4090))
+   AND data_source_name = 'Quickbooks'
+ GROUP BY LAST_DAY(dd.calendar_date)
+),
+
+product_cogs AS
+(
+WITH product_other AS
+(SELECT LAST_DAY(dd.calendar_date) AS end_of_month
+      ,SUM(net_amt)                AS product_other_cogs
+  FROM core.fact_gl_transaction fgt
+  JOIN core.dim_date dd ON dd.dim_date_id = fgt.dim_trans_date_id
+  JOIN core.dim_gl_account dga ON dga.dim_gl_account_id = fgt.dim_gl_account_id
+ WHERE gl_acct_number IN (5020,5030,5040,5041)
+ GROUP BY LAST_DAY(dd.calendar_date)
+),
+ 
+product_wages AS
+(SELECT LAST_DAY(dd.calendar_date) AS end_of_month
+      ,SUM(net_amt)               AS product_wage_cogs
+  FROM core.fact_gl_transaction fgt
+  JOIN core.dim_date dd ON dd.dim_date_id = fgt.dim_trans_date_id
+  JOIN core.dim_gl_account dga ON dga.dim_gl_account_id = fgt.dim_gl_account_id
+  JOIN core.dim_department ddd ON ddd.dim_department_id = fgt.dim_department_id
+ WHERE gl_acct_number BETWEEN 5050 AND 5060
+   AND ddd.department_name IN ('CSCOGS'
+                               ,'Customer Support'
+                               ,'Infrastructure - COGS'
+                               ,'Infrastructure'
+                               ,'Engineering'
+                               ,'G&A'
+                               ,'N/A'
+                               ,'Customer Success & Integrations')
+ GROUP BY LAST_DAY(dd.calendar_date)
+)
+  
+SELECT pw.end_of_month
+      ,COALESCE(pw.product_wage_cogs,0) + COALESCE(po.product_other_cogs,0) AS product_cogs
+  FROM product_wages pw
+  JOIN product_other po
+    ON pw.end_of_month = po.end_of_month
+),
+
+service_cogs AS
+(
+WITH service_other AS
+(SELECT LAST_DAY(dd.calendar_date) AS end_of_month
+      ,SUM(net_amt)                AS service_other_cogs
+  FROM core.fact_gl_transaction fgt
+  RIGHT JOIN core.dim_date dd ON dd.dim_date_id = fgt.dim_trans_date_id
+  JOIN core.dim_gl_account dga ON dga.dim_gl_account_id = fgt.dim_gl_account_id
+ WHERE gl_acct_number IN (5012,5013)
+ GROUP BY LAST_DAY(dd.calendar_date)
+),
+ 
+service_wages AS
+(SELECT LAST_DAY(dd.calendar_date) AS end_of_month
+      ,SUM(net_amt)               AS service_wage_cogs
+  FROM core.fact_gl_transaction fgt
+  RIGHT JOIN core.dim_date dd ON dd.dim_date_id = fgt.dim_trans_date_id
+  JOIN core.dim_gl_account dga ON dga.dim_gl_account_id = fgt.dim_gl_account_id
+  JOIN core.dim_department ddd ON ddd.dim_department_id = fgt.dim_department_id
+ WHERE gl_acct_number BETWEEN 5050 AND 5060
+   AND ddd.department_name NOT IN ('CSCOGS'
+                                   ,'Customer Support'
+                                   ,'Infrastructure - COGS'
+                                   ,'Infrastructure'
+                                   ,'Engineering'
+                                   ,'G&A'
+                                   ,'N/A'
+                                   ,'Customer Success & Integrations')
+ GROUP BY LAST_DAY(dd.calendar_date)
+)
+  
+SELECT so.end_of_month
+      ,COALESCE(sw.service_wage_cogs,0) + so.service_other_cogs AS service_cogs
+  FROM service_wages sw
+  RIGHT JOIN service_other so
+    ON sw.end_of_month = so.end_of_month
+),
+
+gm AS (
+  WITH revenue AS
+(
+SELECT LAST_DAY(dd.calendar_date) AS end_of_month
+      ,SUM(net_amt)            AS revenue
+  FROM core.fact_gl_transaction fgt
+  JOIN core.dim_date dd ON dd.dim_date_id = fgt.dim_trans_date_id
+  JOIN core.dim_data_source dds ON dds.dim_data_source_id = fgt.dim_data_source_id
+  JOIN core.dim_gl_account dga ON dga.dim_gl_account_id = fgt.dim_gl_account_id
+ WHERE gl_acct_number BETWEEN 4000 AND 4990
+   AND data_source_name = 'Netsuite GSheet Revenue'
+ GROUP BY LAST_DAY(dd.calendar_date)
+ UNION
+SELECT LAST_DAY(dd.calendar_date) AS end_of_month
+      ,SUM(net_amt)            AS revenue
+  FROM core.fact_gl_transaction fgt
+  JOIN core.dim_date dd ON dd.dim_date_id = fgt.dim_trans_date_id
+  JOIN core.dim_data_source dds ON dds.dim_data_source_id = fgt.dim_data_source_id
+  JOIN core.dim_gl_account dga ON dga.dim_gl_account_id = fgt.dim_gl_account_id
+ WHERE gl_acct_number BETWEEN 4000 AND 4990
+   AND data_source_name = 'Quickbooks'
+ GROUP BY LAST_DAY(dd.calendar_date)
+),
+
+cogs AS
+(
+SELECT LAST_DAY(dd.calendar_date) AS end_of_month
+      ,SUM(net_amt)                AS cogs
+  FROM core.fact_gl_transaction fgt
+  JOIN core.dim_date dd ON dd.dim_date_id = fgt.dim_trans_date_id
+  JOIN core.dim_gl_account dga ON dga.dim_gl_account_id = fgt.dim_gl_account_id
+ WHERE gl_acct_number BETWEEN 5000 and 5069
+ GROUP BY LAST_DAY(dd.calendar_date)
+)
+  
+SELECT r.end_of_month AS dt
+      ,(r.revenue - c.cogs) / r.revenue   AS gross_margin_prcnt
+  FROM revenue r
+  LEFT JOIN cogs c ON r.end_of_month = c.end_of_month
+  )
+
+SELECT gm.dt
+      ,(pr.product_revenue - pc.product_cogs) / pr.product_revenue    AS product_gross_margin_prcnt
+      ,(sr.service_revenue - sc.service_cogs) / sr.service_revenue    AS service_gross_margin_prcnt
+      ,gross_margin_prcnt
+  FROM product_revenue pr
+  LEFT JOIN service_revenue sr ON pr.end_of_month = sr.end_of_month
+  LEFT JOIN product_cogs    pc ON pr.end_of_month = pc.end_of_month
+  LEFT JOIN service_cogs    sc ON pr.end_of_month = sc.end_of_month
+  LEFT JOIN gm                 ON pr.end_of_month = gm.dt
+ WHERE gross_margin_prcnt IS NOT NULL
+ ORDER BY gm.dt ASC

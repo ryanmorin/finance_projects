@@ -1,0 +1,17 @@
+WITH bank_balances AS (
+  [end_of_month_bank_balance]
+  ),
+
+avg_burn AS (
+  [avg_cash_burn]
+  )
+
+SELECT b.dt
+      ,b.bank_balance
+      ,a.avg_cash_burn
+      ,CASE WHEN ROUND(b.bank_balance / a.avg_cash_burn * -1,0) > 0 THEN ROUND(b.bank_balance / a.avg_cash_burn * -1,0)
+            ELSE NULL
+        END AS num_mnths_to_cash_out
+  FROM bank_balances AS b
+  JOIN avg_burn      AS a
+    ON b.dt = a.dt
