@@ -1,0 +1,176 @@
+Sub ColumnHeaders()
+
+'Activate the worksheet'
+Worksheets("output").Activate
+
+'Delete the current contents of the page'
+Cells.Select
+Selection.Delete Shift:=xlUp
+
+'Create column headers on the output tab'
+Range("X1").Value = "Department" 'A'
+Range("Y1").Value = "SubDepartment" 'B'
+Range("Z1").Value = "Account" 'C'
+Range("AA1").Value = "AccountDetail" 'D'
+Range("AB1").Value = "Description" 'E'
+Range("AC1").Value = "Vendor" 'F'
+
+End Sub
+
+Sub ConvertTextToNumber()
+'The data coming out of oracle formats the dept and account columns as a text string which messes up the vlookup'
+
+'Activate the worksheet'
+Worksheets("data_sheet").Activate
+
+With Range("A2:E" & Range("B1").End(xlDown).Row)
+.NumberFormat = "General"
+.Value = .Value
+End With
+
+End Sub
+
+Sub departmentAccountLookup()
+
+'declare variables'
+Dim dataSheet As Worksheet
+Dim departmentName As Worksheet
+Dim accountName As Worksheet
+Dim output As Worksheet
+Dim dataSheetendRow As Long
+Dim dataSheetstartRow As Long
+Dim departmentEndRow As Long
+Dim departmentStartRow As Long
+Dim accountEndRow As Long
+Dim accountStartRow As Long
+Dim deptRng As Range
+Dim acctRng As Range
+Dim x As Long
+
+
+'Set the worksheets = to the declared variable'
+Set dataSheet = ThisWorkbook.Worksheets("data_sheet")
+Set departmentName = ThisWorkbook.Worksheets("department_name_lookup")
+Set accountName = ThisWorkbook.Worksheets("account_name_lookup")
+Set output = ThisWorkbook.Worksheets("output")
+
+'What row to start on the data_sheet'
+dataSheetstartRow = 2
+departmentStartRow = 2
+accountStartRow = 2
+
+'Count the number of rows of the data_sheet and the department data'
+dataSheetendRow = dataSheet.Range("A1").End(xlDown).Row
+departmentEndRow = departmentName.Range("A1").End(xlDown).Row
+accountEndRow = accountName.Range("A1").End(xlDown).Row
+
+'Set the lookup range'
+Set deptRng = departmentName.Range("A" & departmentStartRow & ":" & "C" & departmentEndRow)
+Set acctRng = accountName.Range("A" & accountStartRow & ":" & "C" & accountEndRow)
+
+'Loop for the department vlookup'
+'NOTE the value of x will be used as the beginning row of the output tab'
+For x = dataSheetstartRow To dataSheetendRow
+    On Error Resume Next
+    output.Range("X" & x).Value = Application.WorksheetFunction.VLookup( _
+    dataSheet.Range("C" & x).Value, deptRng, 2, False) '2 = the second column of the department lookup'
+    
+    output.Range("Y" & x).Value = Application.WorksheetFunction.VLookup( _
+    dataSheet.Range("C" & x).Value, deptRng, 3, False) '3 = the third column of the department lookup'
+    
+    output.Range("Z" & x).Value = Application.WorksheetFunction.VLookup( _
+    dataSheet.Range("D" & x).Value, acctRng, 2, False) '2 = the second column of the account lookup'
+    
+    output.Range("AA" & x).Value = Application.WorksheetFunction.VLookup( _
+    dataSheet.Range("D" & x).Value, acctRng, 3, False) '3 = the second column of the account lookup'
+Next x
+
+End Sub
+
+Sub vendorExtract()
+
+'declare variables'
+Dim dataSheet As Worksheet
+Dim output As Worksheet
+Dim z As Long
+Dim a As Long
+
+'Set the worksheets = to the declared variable'
+Set dataSheet = ThisWorkbook.Worksheets("data_sheet")
+Set output = ThisWorkbook.Worksheets("output")
+
+'What row to start on the data_sheet'
+dataSheetstartRow = 2
+
+'Count the number of rows of the data_sheet and the department data'
+dataSheetendRow = dataSheet.Range("A1").End(xlDown).Row
+
+'This loop updates the vendor column'
+For z = dataSheetstartRow To dataSheetendRow
+    If Not IsEmpty(dataSheet.Range("L" & z).Value) Then 'column L = party in the oracle report'
+        output.Range("AC" & z).Value = dataSheet.Range("L" & z).Value 'And output.Range("F" & z).Value = dataSheet.Range("R" & z).Value'
+    ElseIf dataSheet.Range("K" & z).Value = "Travel & Expense" Then 'column K = party in the oracle report'
+        output.Range("AC" & z).Value = dataSheet.Range("R" & z).Value
+    ElseIf dataSheet.Range("K" & z).Value = "Accrual" Then
+        output.Range("AC" & z).Value = Trim(Right(dataSheet.Range("R" & z).Value, Len(dataSheet.Range("R" & z).Value) - InStrRev(dataSheet.Range("R" & z).Value, ":")))
+    ElseIf dataSheet.Range("K" & z).Value = "Adjustment" Then
+        output.Range("AC" & z).Value = Trim(Right(dataSheet.Range("R" & z).Value, Len(dataSheet.Range("R" & z).Value) - InStr(dataSheet.Range("R" & z).Value, "-")))
+    End If
+Next z
+
+'This loop updates the description column'
+For a = dataSheetstartRow To dataSheetendRow
+    If Not IsEmpty(dataSheet.Range("L" & a).Value) Then 'column L = party in the oracle report'
+        output.Range("AB" & a).Value = dataSheet.Range("R" & a).Value
+    ElseIf dataSheet.Range("K" & a).Value = "Accrual" Then
+        output.Range("AB" & a).Value = Trim(Right(dataSheet.Range("R" & a).Value, Len(dataSheet.Range("R" & a).Value) - InStrRev(dataSheet.Range("R" & a).Value, ":")))
+    ElseIf dataSheet.Range("K" & a).Value = "Adjustment" Then
+        If InStr(dataSheet.Range("R" & a).Value, "Credit Card") > 0 Then
+            output.Range("AB" & a).Value = "Credit Card"
+        Else
+            output.Range("AB" & a).Value = Trim(Right(dataSheet.Range("R" & a).Value, Len(dataSheet.Range("R" & a).Value) - InStr(dataSheet.Range("R" & a).Value, "-")))
+        End If
+    End If
+Next a
+
+
+End Sub
+
+Sub FormatDocument()
+
+'Activate the worksheet'
+Worksheets("output").Activate
+
+Range("X1:AC1").Font.Bold = True
+Range("X1:AC1").Borders(xlEdgeBottom).LineStyle = xlContinuous
+Columns("X:AC").AutoFit
+
+End Sub
+
+Sub moveData()
+
+'create varaible'
+Dim rng As Range
+
+'activate the data_sheet worksheet'
+Worksheets("data_sheet").Activate
+
+'create set the range'
+Set rng = ActiveSheet.UsedRange
+rng.Copy
+
+'activate the data_sheet worksheet and Paste'
+Worksheets("output").Activate
+Range("A1").PasteSpecial Paste:=xlPasteValues
+
+End Sub
+
+'This macro calls all macros'
+Sub Noah_Run_Me()
+    Call ColumnHeaders
+    Call ConvertTextToNumber
+    Call moveData
+    Call departmentAccountLookup
+    Call vendorExtract
+    Call FormatDocument
+End Sub
