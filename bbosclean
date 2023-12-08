@@ -1,0 +1,140 @@
+import pandas as pd
+import os
+import numpy as np
+import math
+
+
+def calculate_inventory_owned_flag(row):
+    # Your calculate_inventory_owned_flag function remains unchanged
+    # wholesaler_id = 263 --> Member Sourcing --> Rule a/p Rob
+    if row['purchase_type'] == 'consignment' and row['wholesaler_id'] == 343:
+        return 'no' # upteam consignment
+    elif row['purchase_type'] == 'consignment' and (row['cost'] <= 1 or math.isnan(row['cost'])):
+        return 'no' # other consigners ie. Kuwait
+    elif row['purchase_type'] == 'private_sale_member_sourcing' and (row['cost'] <= 1 or math.isnan(row['cost'])):
+        return 'no' # misc mis consigners
+    else:
+        return 'yes'
+
+
+def clean_file(file_name, output_path, input_path):
+    # Your clean_file function remains unchanged
+    # column names dictionary
+    col_names_dict = {
+        'as_of_date': 'as_of_date',
+        'unique_inventoryid': 'unique_inventory_id',
+        'asset_ID': 'asset_id',
+        'productID': 'product_id',# delete
+        'location': 'location',
+        'Location Date': 'location_date',
+        'Date Received': 'date_received',
+        'Cost': 'cost',
+        'product_type': 'product_type',# delete
+        'brand': 'brand',# delete
+        'purchase_type': 'purchase_type',
+        'Site': 'site',
+        'product_name': 'product_name',# delete
+        'MSRP': 'msrp',# delete
+        'Physical Location': 'physical_location',# delete
+        'level': 'level', # delete
+        'Availability': 'availability', # delete
+        'wholesalerID': 'wholesaler_id',
+        'Wholesaler': 'wholesaler'
+    }
+
+    # Use pd.read_csv() to read the CSV file into a Pandas DataFrame
+    df = pd.read_csv(f'{input_path}{file_name}')
+
+    # Rename the column names using col_names_dict
+    df = df.rename(columns=col_names_dict)
+
+    # clean some of the columns
+    df['cost'] = df['cost'].replace('NULL', '0')
+    df['cost'] = df['cost'].replace('', '0') #ryan
+    #df['as_of_date'] = pd.to_datetime(df['as_of_date'], format='%m/%d/%y')
+    #df['location_date'] = pd.to_datetime(df['location_date'], format='%m/%d/%y')
+    #df['date_received'] = pd.to_datetime(df['date_received'], format='%m/%d/%y')
+    df['purchase_type'] = df['purchase_type'].str.lower()
+    df['site'] = df['site'].str.lower()
+    df['location'] = df['location'].str.lower()
+
+
+    # Convert the 'cost' column to a numeric type (in case it's not already)
+    df['cost'] = pd.to_numeric(df['cost'], errors='coerce')
+
+    # Select important fields from inventory
+    important_fields = ['as_of_date',
+                        'asset_id',
+                        'cost',
+                        'date_received',
+                        'location',
+                        'location_date',
+                        'purchase_type',
+                        'site',
+                        'unique_inventory_id',
+                        'wholesaler',
+                        'wholesaler_id']
+
+    # Create new dataframe with important fields
+    new_df = df[important_fields]
+
+    # Create new column called inventory_owned_flag --> boolean 'yes', 'no'
+    new_df.loc[:, 'inventory_owned_flag'] = new_df.apply(calculate_inventory_owned_flag, axis=1)
+
+    # Create new column called inventory_classification --> 'rental, outlet, consignment, outlet_to_rental, rental_to_outlet'
+    conditions = [
+        (new_df['inventory_owned_flag'] == 'yes') & (new_df['location'] == 'moved_to_rental'), # category that indicates the movement between buckets
+        (new_df['inventory_owned_flag'] == 'yes') & (new_df['location'] == 'moved_to_outlet'), # category that indicates the movement between buckets
+        (new_df['inventory_owned_flag'] == 'yes') & (new_df['purchase_type'] == 'consignment'), #
+        (new_df['inventory_owned_flag'] == 'no') & (new_df['purchase_type'] == 'consignment') & (new_df['site'] == 'rental'),
+        (new_df['inventory_owned_flag'] == 'no') & (new_df['purchase_type'] == 'consignment') & (new_df['site'] == 'outlet'),
+        (new_df['purchase_type'] == 'rental') & (new_df['site'] == 'rental'),
+        (new_df['purchase_type'] == 'rental') & (new_df['site'] == 'outlet'),
+        (new_df['purchase_type'] != 'rental') & (new_df['purchase_type'] != 'consignment') & (new_df['site'] == 'outlet'),
+        (new_df['purchase_type'] != 'rental') & (new_df['purchase_type'] != 'consignment') & (new_df['site'] == 'rental')
+    ]
+
+    # The conditions above will me mapped to the inventory tags below
+    values = ['rental', 'rental_to_outlet', 'outlet', 'rental', 'consignment', 'rental', 'rental_to_outlet',
+              'outlet', 'rental']
+
+    # Use numpy.select to create the 'inventory_classification' column
+    new_df.loc[:, 'inventory_classification'] = np.select(conditions, values, default=None)
+
+
+    # Calculate the row number within each partition --> asset_id will appear multiple times for
+    # inventory that was moved_to_rental or moved_to_outlet and new SKU was created
+    # we don't want to count inventory twice. This will identify that inventory.
+
+    # first make sure that dates in date format
+    new_df['location_date'] = pd.to_datetime(new_df['location_date'])
+
+    # Sort the DataFrame by 'date' in descending order --> newest first
+    new_df = new_df.sort_values(by='location_date', ascending=False)
+
+    # create a row number - 1 is the newest - most recent location for inventory
+    new_df['row_number'] = new_df.groupby('asset_id')['location_date'].rank(method='dense', ascending=False)
+
+    new_file_name = file_name.replace('.csv', '_cleaned.csv')
+
+    new_df.to_csv(f'{output_path}{new_file_name}', index=False)
+
+
+def main():
+    input_path = '/Users/ryanmorin/PycharmProjects/bagborroworsteal/clean_inventory/input/'
+    output_path = '/Users/ryanmorin/PycharmProjects/bagborroworsteal/clean_inventory/output/'
+
+    # Use os.listdir() to get a list of all files in the folder
+    items = os.listdir(input_path)
+
+    # Filter out only the file names (exclude directories)
+    csv_files = [file for file in items if 'inventory' in file and file.endswith('.csv')]
+
+    files = [file for file in csv_files]
+    # Clean the files -> cleans the files an puts them in the folder
+    for file in files:
+        clean_file(file, output_path, input_path)
+
+
+if __name__ == "__main__":
+    main()
