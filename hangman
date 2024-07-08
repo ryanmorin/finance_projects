@@ -1,0 +1,18 @@
+import my_module
+import random
+
+hangman_list = list()
+number_of_missed_guesses = 0
+
+chosen_word = random.choice(my_module.word_list)
+for ltr in range(0, len(chosen_word)):
+    hangman_list.append('_')
+
+while number_of_missed_guesses < 4:
+    guess = input('Guess a letter. \n').lower()
+    if chosen_word.find(guess) < 0:
+        number_of_missed_guesses += 1
+    for cnt in range(0, len(chosen_word)):
+        if guess == chosen_word[cnt]:
+            hangman_list[cnt] = guess
+    print(hangman_list)
