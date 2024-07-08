@@ -15,4 +15,7 @@ while number_of_missed_guesses < 4:
     for cnt in range(0, len(chosen_word)):
         if guess == chosen_word[cnt]:
             hangman_list[cnt] = guess
+    if hangman_list.count('_') == 0:
+        print('Congratulations you won!')
+        number_of_missed_guesses = 4
     print(hangman_list)
