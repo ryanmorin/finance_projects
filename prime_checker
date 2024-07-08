@@ -1,0 +1,16 @@
+n = int(input("Enter a number up to 100\n"))
+num_list = list()
+
+def prime_checker(n):
+    if n != 1:
+        for i in range(2, 13):
+            if n % i == 0:
+                num_list.append(1)
+            else:
+                num_list.append(0)
+    if sum(num_list) >= 1:
+        return(f"Not prime")
+    else:
+        return(f"Prime number")
+
+print(prime_checker(n))
