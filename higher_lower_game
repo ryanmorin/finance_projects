@@ -1,0 +1,61 @@
+import random
+import config
+
+DATA = config.data
+score = 0
+winning_number = -1
+game_is_running = True
+
+
+def random_number() -> int:
+    return random.randint(0, 3)
+
+
+def user_answer(num1, num2) -> list:
+    answer = []
+
+    print(f"Compare A: {DATA[num1]['name']}, a {DATA[num1]['description']}, from {DATA[num1]['country']}\n")
+    print(f"Against B: {DATA[num2]['name']}, a {DATA[num2]['description']}, from {DATA[num2]['country']}\n")
+    
+    user_answer = input('Who has more followers? Type "A" or "B": ')
+    answer.append(user_answer)
+
+    if DATA[num1]['follower_count'] > DATA[num2]['follower_count']:
+        answer.append('A')
+    else:
+        answer.append('B')
+
+    # number of right answer
+    answer.append(num1)
+
+    # position = 0 user, position = 1 answer, position = 2 list_position
+    return answer
+
+
+def win_or_lose(tbl) -> int:
+    if tbl[0] == tbl[1]:
+        return 1
+    else:
+        return 0
+
+
+while game_is_running:
+    if winning_number == -1:
+        num1 = random_number()
+    else:
+        num1 = winning_number
+
+    num2 = random_number()
+    if num2 == num1:
+        num2 = random_number()
+
+    output = user_answer(num1=num1, num2=num2)
+
+    if output[0] != output[1]:
+        score += win_or_lose(output)
+        print(f"Wrong. Your score is {score}\n")
+        game_is_running = False
+    else:
+        score += win_or_lose(output)
+        winning_number = output[2]
+        print(f"Correct. Your score is: {score}\n")
