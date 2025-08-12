@@ -1,0 +1,459 @@
+name: LOAN_PERFORMANCE_INFORMATION
+description: Combines aspects of static loan characteristics with dynamic loan information. The dynamic loan information is aggregated by month.
+tables:
+  - name: DYNAMIC_LOAN_CHARACTERISTICS
+    description: The dynamic loan characteristics will change monthly.
+    base_table:
+      database: LEGACYDB
+      schema: REPORTING
+      table: TBL_DYNAMIC_LOAN
+    primary_key:
+      columns:
+        - LOAN_ID
+    dimensions:
+      - name: LOAN_ID
+        description: The mosaic loan_id
+        expr: loan_id
+        data_type: NUMBER(38,0)
+    facts:
+      - name: FEES
+        synonyms:
+          - fees paid
+          - fees payment
+        description: The amount of fees received on the loan for the month ending the report date.
+        expr: all_fees_amount
+        data_type: NUMBER(26,4)
+      - name: INTEREST
+        synonyms:
+          - interest paid
+          - interest payment
+        description: The amount of interest payment received on the loan for the month ending the report date.
+        expr: interest
+        data_type: NUMBER(26,4)
+      - name: LOAN_AMOUNT_UNDISBURSED
+        synonyms:
+          - amount undisbursed
+        description: The portion of the original_amount that has not been disbursed for the month ending the report date.
+        expr: amt_undisb
+        data_type: FLOAT
+      - name: PRINCIPAL_BALANCE_AT_MONTH_END
+        synonyms:
+          - outstanding principal balance
+          - current balance
+          - outstanding amount
+        description: The outstanding principal balance of the loan as of the report date
+        expr: principal_balance
+        data_type: NUMBER(16,2)
+      - name: PRIN_PAY
+        synonyms:
+          - principal paid
+          - principal payment
+        description: The amount of principal payment received on the loan for the month ending the report date.
+        expr: prin_pay
+        data_type: NUMBER(26,4)
+    time_dimensions:
+      - name: REPORT_DATE
+        synonyms:
+          - as of date
+        description: The period that the data includes.
+        expr: report_date
+        data_type: DATE
+        unique: false
+  - name: LOAN_CHARACTERISTICS
+    description: The static loan characteristics assigned to a loan when the opportunity is created and do not change.
+    base_table:
+      database: LEGACYDB
+      schema: REPORTING
+      table: TBL_STATIC_LOAN
+    primary_key:
+      columns:
+        - LOAN_ID
+    unique_keys:
+      - columns:
+          - LOAN_AGREEMENT_ID
+      - columns:
+          - OPPORTUNITY_ID
+    dimensions:
+      - name: CHANNEL_PARTNER_NAME
+        synonyms:
+          - installer
+          - dealer
+          - channel partner
+        description: Name of the original dealer that submitted the opportunity.
+        expr: original_dealer_name
+        data_type: VARCHAR(512)
+      - name: CURRENT_FACILITY_ID
+        synonyms:
+          - investor id
+          - warehouse id
+          - current investor id
+          - current warehouse id
+        description: Identification number of the current owner of the loan according to the servicer.
+        expr: latest_facility
+        data_type: NUMBER(38,0)
+        sample_values:
+          - 1
+          - 2
+          - 3
+          - 62
+      - name: CURRENT_FACILITY_NAME
+        synonyms:
+          - current investor name
+          - current warehouse name
+          - investor name
+          - warehouse name
+        description: The name of the current owner of the loan according to the servicer.
+        expr: facility_name
+        data_type: VARCHAR(65535)
+        sample_values:
+          - Mosaic Solar Loans Trust 2017-1
+          - Carlyle
+          - Modern Home
+          - GLOBAL ATLANTIC HOME FACILITY
+          - PartnerRe
+      - name: CURRENT_INTEREST_RATE
+        synonyms:
+          - interest rate
+        description: The current interest rate associated with the loan. The rate is used by the servicer to calculate the portion of the payment applied to principal and interest.
+        expr: current_int_rate
+        data_type: NUMBER(14,4)
+      - name: DAYS_PAST_DUE
+        synonyms:
+          - dpd
+          - number of days in arrears
+        description: Days past due refers to the number of days that have passed since a payment was due on a loan without the scheduled payment being made.
+        expr: days_past_due
+        data_type: NUMBER(38,0)
+      - name: DEALER_FEE_PERCENTAGE
+        synonyms:
+          - dealer fee percentage
+          - dealer fee rate
+          - dealer fee
+        description: The dealer fee rate is the fee charged to the channel partner for the privilege of being part of the Mosaic Platform. This amount is withheld at disbursement.
+        expr: dealer_fee
+        data_type: FLOAT
+      - name: FICO
+        synonyms:
+          - fico score
+        description: Final FICO score of the primary borrower.
+        expr: fico
+        data_type: NUMBER(19,5)
+      - name: LOAN_MONTH_TERM
+        description: Total term of the loan in months.
+        expr: loan_month_term
+        data_type: NUMBER(38,0)
+      - name: PRODUCT_CATEGORY
+        description: Mosaic’s products grouped by characteristics.
+        expr: product_meta_category
+        data_type: VARCHAR(256)
+        sample_values:
+          - Home Improvement RRAPR
+          - Solar Dual Rate (SR/RSR)
+          - Home Improvement SAC Promo
+          - Solar PowerSwitch (Plus)
+          - PowerSwitch Light
+          - Solar Flex Ream (NSR)
+          - PowerSwitch Zero
+          - Resi Solar Farm
+          - Solar PowerSwitch (Choice)
+      - name: PRODUCT_FAMILY
+        description: Classification based on loan purpose.
+        expr: product_family
+        data_type: VARCHAR(16)
+        sample_values:
+          - Home Improvement
+          - Solar
+      - name: STATE
+        synonyms:
+          - us state
+        description: U.S. state where the property is located.
+        expr: state
+        data_type: VARCHAR(2)
+    facts:
+      - name: ACCRUED_INTEREST_BALANCE
+        synonyms:
+          - interest receivable
+          - accrued interest amount
+        description: The current balance of interest owed to Mosaic according to the servicer.
+        expr: interest_receivable
+        data_type: NUMBER(12,2)
+      - name: CHARGEOFF_AMOUNT
+        synonyms:
+          - charged off amount
+          - amount charged off
+        description: Amount of the loan charged off.
+        expr: co_amt
+        data_type: NUMBER(12,2)
+      - name: DEALER_FEE_DEDUCTION
+        synonyms:
+          - dealer fee deduction
+          - dealer fee amount
+          - amount of dealer fee
+        description: Dealer fee deducted from the original loan amount.
+        expr: dealer_fee_deduction
+        data_type: FLOAT
+      - name: ORIGINAL_AMOUNT
+        synonyms:
+          - loan amount
+          - original amount
+        description: Contracted loan amount at origination.
+        expr: original_amount
+        data_type: NUMBER(16,2)
+    time_dimensions:
+      - name: CANCEL_DATE
+        synonyms:
+          - cancel date
+          - date cancelled
+        description: Date the loan was cancelled.
+        expr: cancel_date
+        data_type: DATE
+        unique: false
+      - name: CHARGEOFF_DATE
+        synonyms:
+          - charge off date
+          - chargeoff date
+          - date charged off
+        description: Date the charge-off was recorded in the servicer systems.
+        expr: chargeoff_date
+        data_type: DATE
+        unique: false
+      - name: COUNTERSIGN_DATE
+        synonyms:
+          - countersigned date
+          - date countersigned
+          - M0
+        description: Date the loan agreement was countersigned.
+        expr: countersign_date
+        data_type: DATE
+        unique: false
+      - name: EQUIPMENT_DATE
+        synonyms:
+          - equipment approved date
+          - M1 approved date
+        description: Date the date the equipment milestone also called M1 was approved by Mosaic.
+        expr: equipment_date
+        data_type: TIMESTAMP_TZ(9)
+        unique: false
+      - name: INSTALLATION_DATE
+        synonyms:
+          - install approved date
+          - M2 approved date
+        description: Date the date the installation milestone also called M2 was approved by Mosaic.
+        expr: install_date
+        data_type: TIMESTAMP_TZ(9)
+        unique: false
+      - name: MATURITY_DATE
+        synonyms:
+          - maturity date
+        description: |
+          Original maturity date supplied by Mosaic. Initially set to 90 days from origination, updated by Concord at final milestone funding.
+        expr: maturity_date
+        data_type: DATE
+        unique: false
+      - name: ORIGINATION_DATE
+        synonyms:
+          - origination date
+          - date loan originated
+          - date originated
+        description: Date of the first loan advance.
+        expr: origination_date
+        data_type: DATE
+        unique: false
+      - name: PROMO_END_DATE
+        synonyms:
+          - promo end date
+          - promotional period end date
+        description: End of the promotional period.
+        expr: promo_end_date
+        data_type: DATE
+        unique: false
+      - name: PTO_DATE
+        synonyms:
+          - permission to operate date
+          - pto
+          - M3
+        description: Date the date the permission to operate milestone also called M3 was approved by Mosaic.
+        expr: pto_date
+        data_type: TIMESTAMP_TZ(9)
+        unique: false
+relationships:
+  - name: LOAN_PORTFOLIO_PERFORMANCE
+    left_table: DYNAMIC_LOAN_CHARACTERISTICS
+    right_table: LOAN_CHARACTERISTICS
+    relationship_columns:
+      - left_column: LOAN_ID
+        right_column: LOAN_ID
+    relationship_type: many_to_one
+    join_type: inner
+verified_queries:
+  - name: How much principal and interest were received on the loans between Jan 2022 and July 2022?
+    question: How much principal and interest were received on the loans between Jan 2022 and July 2022?
+    sql: |-
+      SELECT
+        report_date,
+        SUM(prin_pay) AS principal_amount_paid,      
+        SUM(interest) AS interest_amount_paid
+      FROM
+        dynamic_loan_characteristics
+      GROUP BY
+        1
+    use_as_onboarding_question: false
+    verified_by: Ryan Morin
+    verified_at: 1754415512
+  - name: What was the loan amount originated in each month?
+    question: What was the loan amount originated in each month?
+    sql: |-
+      SELECT
+        TO_CHAR(origination_date, 'MM-yyyy') AS month_year,
+        SUM(original_amount) AS total_loan_amount
+      FROM
+        loan_characteristics
+      GROUP BY
+        1
+    use_as_onboarding_question: false
+    verified_by: Ryan Morin
+    verified_at: 1754415512
+  - name: loan amount cancelled in each month
+    question: What was the loan amount cancelled in each month?
+    sql: |-
+      SELECT TO_CHAR(cancel_date, 'MM-yyyy') AS month_year,
+             SUM(original_amount) AS total_loan_amount
+      FROM loan_characteristics
+      WHERE cancel_date IS NOT NULL
+      GROUP BY 1
+    verified_by: ryan morin
+    verified_at: 1754352000
+  - name: how many loans were cancelled in each month
+    question: How many loans were cancelled each month?
+    sql: |-
+      SELECT TO_CHAR(cancel_date, 'MM-yyyy') AS month_year,
+             COUNT(loan_id) AS total_number_of_loans
+      FROM loan_characteristics
+      WHERE cancel_date IS NOT NULL
+      GROUP BY 1
+    verified_by: ryan morin
+    verified_at: 1754352000
+  - name: how many solar loans were originated in each month
+    question: How many solar loans were originated in each month?
+    sql: |-
+      SELECT TO_CHAR(origination_date, 'MM-yyyy') AS month_year,
+             COUNT(loan_id) AS total_number_of_loans
+      FROM loan_characteristics
+      WHERE product_family = 'Solar'
+      GROUP BY 1
+    verified_by: ryan morin
+    verified_at: 1754352000
+  - name: how many loans were cancelled in each month?
+    question: how many loans were cancelled in each month?
+    sql: |-
+      SELECT TO_CHAR(cancel_date, 'MM-yyyy') AS month_year,
+             COUNT(*) AS number_of_loans
+      FROM loan_characteristics
+      WHERE NOT cancel_date IS NULL
+      GROUP BY 1
+    use_as_onboarding_question: false
+    verified_by: Ryan Morin
+    verified_at: 1754416053
+  - name: How many solar loans were originated in each month
+    question: How many solar loans were originated in each month
+    sql: |-
+      SELECT TO_CHAR(origination_date, 'MM-yyyy') AS month_year,
+             COUNT(*) AS total_number_of_loans
+      FROM loan_characteristics
+      WHERE product_family = 'Solar'
+      GROUP BY 1
+    use_as_onboarding_question: false
+    verified_by: Ryan Morin
+    verified_at: 1754416105
+  - name: Excluding cancelled loans, how many solar loans were originated in each month?
+    question: Excluding cancelled loans, how many solar loans were originated in each month?
+    sql: |-
+      SELECT TO_CHAR(origination_date, 'MM-yyyy') AS month_year,
+             COUNT(*) AS total_number_of_loans
+      FROM loan_characteristics
+      WHERE product_family = 'Solar'
+        AND cancel_date IS NULL
+      GROUP BY 1
+    use_as_onboarding_question: false
+    verified_by: Ryan Morin
+    verified_at: 1754416229
+  - name: What is the average fico score for loans originated during the month of Dec 2023?
+    question: What is the average fico score for loans originated during the month of Dec 2023?
+    sql: |-
+      SELECT AVG(fico) AS average_fico_score
+      FROM loan_characteristics
+      WHERE origination_date BETWEEN '2023-12-01' AND '2023-12-31'
+    use_as_onboarding_question: false
+    verified_by: Ryan Morin
+    verified_at: 1754416300
+  - name: How much principal and interest was paid between Jan 2022 and July 2022?
+    question: How much principal and interest was paid between Jan 2022 and July 2022?
+    sql: |-
+      SELECT
+        SUM(prin_pay) AS total_principal_paid,
+        SUM(interest) AS total_interest_paid
+      FROM
+        dynamic_loan_characteristics
+      WHERE
+        report_date BETWEEN '2022-01-01'
+        AND '2022-07-31'
+    use_as_onboarding_question: false
+    verified_by: Ryan Morin
+    verified_at: 1754434505
+  - name: For loans that have a countersigned date during July 2020, how much principal and interest was received between Jan 2023 and July 2023?
+    question: For loans that have a countersigned date during July 2020, how much principal and interest was received between Jan 2023 and July 2023?
+    sql: |-
+      SELECT
+        SUM(dlc.prin_pay) AS total_principal_paid,
+        SUM(dlc.interest) AS total_interest_paid
+      FROM
+        dynamic_loan_characteristics AS dlc
+        INNER JOIN loan_characteristics AS lc ON dlc.loan_id = lc.loan_id
+      WHERE
+        lc.countersign_date BETWEEN '2020-07-01'
+        AND '2020-07-31'
+        AND dlc.report_date BETWEEN '2023-01-01'
+        AND '2023-07-31'
+    use_as_onboarding_question: false
+    verified_by: Ryan Morin
+    verified_at: 1754435698
+  - name: For loans that have a pto date, what's the average number of days between M0 and M3?
+    question: For loans that have a pto date, what's the average number of days between M0 and M3?
+    sql: |-
+      SELECT
+        AVG(DATEDIFF(DAY, countersign_date, pto_date)) AS avg_days_m0_to_m3
+      FROM
+        loan_characteristics
+      WHERE
+        NOT pto_date IS NULL
+        AND NOT countersign_date IS NULL
+    use_as_onboarding_question: false
+    verified_by: Ryan Morin
+    verified_at: 1754498322
+  - name: Can you calculate the weighted average dealer fee based on the loan amount. The data should be grouped by the month and year of the countersigned date. The data should exclude cancelled loans.
+    question: Can you calculate the weighted average dealer fee based on the loan amount. The data should be grouped by the month and year of the countersigned date.  The data should exclude cancelled loans.
+    sql: |-
+      WITH __loan_characteristics AS (
+        SELECT
+          dealer_fee AS dealer_fee_percentage,
+          cancel_date,
+          countersign_date,
+          original_amount
+        FROM
+          legacydb.reporting.tbl_static_loan
+      )
+      SELECT
+        TO_CHAR(countersign_date, 'MM-yyyy') AS month_year,
+        SUM(dealer_fee_percentage * original_amount) / NULLIF(NULLIF(SUM(original_amount), 0), 0) AS weighted_avg_dealer_fee
+      FROM
+        __loan_characteristics
+      WHERE
+        cancel_date IS NULL
+        AND NOT countersign_date IS NULL
+      GROUP BY
+        TO_CHAR(countersign_date, 'MM-yyyy')
+      ORDER BY
+        month_year DESC NULLS LAST
+    use_as_onboarding_question: false
+    verified_by: Ryan Morin
+    verified_at: 1754516450
