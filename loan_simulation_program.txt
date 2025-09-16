@@ -1,0 +1,4010 @@
+##boot session
+# Import python packages
+import streamlit as st
+import pandas as pd
+
+from snowflake.snowpark.context import get_active_session
+session = get_active_session()
+
+##standardize_disbursement_sequence
+CREATE
+OR REPLACE VIEW funworkspacedb.data_analytics.disbursement_sequences AS
+/*
+The following code is needed to create all of the distribution strategies associated with 
+the loan.  This table will be used in the following queries.
+*/
+WITH distributor_strategy AS (
+    SELECT
+        disb_strategy.disbursement_strategy_uuid_c AS disbursement_strategy_id -- , disb_strategy.distributor_disbursement_events_c AS
+,
+        (
+            disb_strategy.distributor_percent_off_loan_c * dist_disb_event.event_1_percent_off_loan_c / 100
+        ) AS countersign,
+        (
+            disb_strategy.distributor_percent_off_loan_c * dist_disb_event.event_2_percent_off_loan_c / 100
+        ) AS equipment,
+        (
+            disb_strategy.distributor_percent_off_loan_c * dist_disb_event.event_3_percent_off_loan_c / 100
+        ) AS installation,
+        (
+            disb_strategy.distributor_percent_off_loan_c * dist_disb_event.event_4_percent_off_loan_c / 100
+        ) AS operation,
+        dist_disb_event.event_1_percent_off_loan_c,
+        dist_disb_event.event_2_percent_off_loan_c,
+        dist_disb_event.event_3_percent_off_loan_c,
+        dist_disb_event.event_4_percent_off_loan_c
+    FROM
+        legacydb.src_salesforce.disbursement_strategy_c AS disb_strategy
+        INNER JOIN legacydb.src_salesforce.disbursement_event_c AS dist_disb_event ON dist_disb_event.id = disb_strategy.distributor_disbursement_events_c
+),
+installer_strategy AS (
+    SELECT
+        disb_strategy.disbursement_strategy_uuid_c AS disbursement_strategy_id,
+        (
+            disb_strategy.installer_percent_off_loan_c * inst_disb_event.event_1_percent_off_loan_c / 100
+        ) AS countersign,
+        (
+            disb_strategy.installer_percent_off_loan_c * inst_disb_event.event_2_percent_off_loan_c / 100
+        ) AS equipment,
+        (
+            disb_strategy.installer_percent_off_loan_c * inst_disb_event.event_3_percent_off_loan_c / 100
+        ) AS installation,
+        (
+            disb_strategy.installer_percent_off_loan_c * inst_disb_event.event_4_percent_off_loan_c / 100
+        ) AS operation,
+        inst_disb_event.event_1_percent_off_loan_c,
+        inst_disb_event.event_2_percent_off_loan_c,
+        inst_disb_event.event_3_percent_off_loan_c,
+        inst_disb_event.event_4_percent_off_loan_c
+    FROM
+        legacydb.src_salesforce.disbursement_strategy_c AS disb_strategy
+        INNER JOIN legacydb.src_salesforce.disbursement_event_c AS inst_disb_event ON inst_disb_event.id = disb_strategy.installer_disbursement_events_c
+),
+project_disbursement_strategy AS (
+    SELECT
+        disb_strategy.disbursement_strategy_uuid_c AS disbursement_strategy_id,
+        (
+            COALESCE(installer_strategy.countersign, 0) + COALESCE(distributor_strategy.countersign, 0)
+        )::varchar || '-' || (
+            COALESCE(installer_strategy.equipment, 0) + COALESCE(distributor_strategy.equipment, 0)
+        )::varchar || '-' || (
+            COALESCE(installer_strategy.installation, 0) + COALESCE(distributor_strategy.installation, 0)
+        )::varchar || '-' || (
+            COALESCE(installer_strategy.operation, 0) + COALESCE(distributor_strategy.operation, 0)
+        )::varchar AS sequence_name
+    FROM
+        legacydb.src_salesforce.disbursement_strategy_c AS disb_strategy
+        LEFT JOIN installer_strategy ON installer_strategy.disbursement_strategy_id = disb_strategy.disbursement_strategy_uuid_c
+        LEFT JOIN distributor_strategy ON distributor_strategy.disbursement_strategy_id = disb_strategy.disbursement_strategy_uuid_c
+),
+project_data AS (
+    SELECT
+        project.opportunity_id,
+        project.disbursement_sequence,
+        project.disbursement_strategy_id,
+        ROW_NUMBER() OVER (
+            PARTITION BY project.opportunity_id
+            ORDER BY
+                project.id DESC
+        ) as row_num
+    FROM
+        legacydb.src_platform_mosaic_live.project
+),
+combined_sequences AS (
+    SELECT
+        opportunity.id AS opportunity_id,
+        COALESCE(
+            nxp2.bank_statement_lines_booking_date,
+            project_disbursement_strategy.sequence_name,
+            '0-' || loan_disbursement_sequence.sequence_name
+        ) AS disbursement_sequence
+    FROM
+        legacydb.src_platform_mosaic_live.opportunity
+        LEFT JOIN project_data ON project_data.opportunity_id = opportunity.id
+        AND project_data.row_num = 1
+        LEFT JOIN legacydb.eba_data_rpt.nxp2_sequence_names AS nxp2 ON nxp2.opportunity_id = opportunity.id
+        LEFT JOIN legacydb.src_platform_mosaic_live.loan_disbursement_sequence ON loan_disbursement_sequence.id = project_data.disbursement_sequence
+        LEFT JOIN project_disbursement_strategy USING(disbursement_strategy_id)
+),
+pre_process AS (
+    SELECT
+        combined_sequences.opportunity_id,
+        CASE
+            WHEN combined_sequences.disbursement_sequence = '0-Unspecified' THEN '0-0-0-0'
+            WHEN combined_sequences.disbursement_sequence = '0-100installComplete' THEN '0-0-100-0'
+            WHEN combined_sequences.disbursement_sequence = '0-80-20' THEN '0-0-80-20'
+            WHEN combined_sequences.disbursement_sequence = '0-30countersign-70installComplete' THEN '30-0-70-0'
+            WHEN combined_sequences.disbursement_sequence IS NULL THEN '0-0-0-0'
+            ELSE combined_sequences.disbursement_sequence
+        END AS disbursement_sequence
+    FROM
+        combined_sequences
+)
+SELECT
+    pre_process.opportunity_id,
+    opportunity.date_created AS date_opportunity_created,
+    pre_process.disbursement_sequence AS disbursement_sequence_name,
+    COALESCE(
+        CAST(
+            SPLIT_PART(pre_process.disbursement_sequence, '-', 1) AS DECIMAL(12, 8)
+        ) / 100,
+        0
+    ) AS m0_disb_seq_decimal,
+    COALESCE(
+        CAST(
+            SPLIT_PART(pre_process.disbursement_sequence, '-', 2) AS DECIMAL(12, 8)
+        ) / 100,
+        0
+    ) AS m1_disb_seq_decimal,
+    COALESCE(
+        CAST(
+            SPLIT_PART(pre_process.disbursement_sequence, '-', 3) AS DECIMAL(12, 8)
+        ) / 100,
+        0
+    ) AS m2_disb_seq_decimal,
+    COALESCE(
+        CAST(
+            SPLIT_PART(pre_process.disbursement_sequence, '-', 4) AS DECIMAL(12, 8)
+        ) / 100,
+        0
+    ) AS m3_disb_seq_decimal,
+    CASE
+        WHEN CAST(
+            SPLIT_PART(pre_process.disbursement_sequence, '-', 1) AS DECIMAL(12, 8)
+        ) != 0 THEN 1
+        ELSE 0
+    END disb_flag_m0,
+    CASE
+        WHEN CAST(
+            SPLIT_PART(pre_process.disbursement_sequence, '-', 2) AS DECIMAL(12, 8)
+        ) != 0 THEN 1
+        ELSE 0
+    END disb_flag_m1,
+    CASE
+        WHEN CAST(
+            SPLIT_PART(pre_process.disbursement_sequence, '-', 3) AS DECIMAL(12, 8)
+        ) != 0 THEN 1
+        ELSE 0
+    END disb_flag_m2,
+    CASE
+        WHEN CAST(
+            SPLIT_PART(pre_process.disbursement_sequence, '-', 4) AS DECIMAL(12, 8)
+        ) != 0 THEN 1
+        ELSE 0
+    END disb_flag_m3
+FROM
+    pre_process
+    LEFT JOIN legacydb.src_platform_mosaic_live.opportunity ON opportunity.id = pre_process.opportunity_id;
+
+## external_call_yield_curve_data
+##pass
+# YOU NEED TO RUN THIS OUTSIDE OF SNOWFLAKE TO GET AROUND FIREWALL
+
+import pandas as pd
+import requests
+
+api_key = "b2fcff39b863ccbee296b9f9d7c113a"
+output = '/Users/ryan.morin/documents/yield_curve.csv'
+
+# beginning and ending dates
+start_date = "2025-09-09" ## ---------- This date MUST correspond to loan_data ----- ###
+end_date = start_date ## must always be 2 days old for current rates ie. 9/11 then 9/9 max
+y_start_date = pd.to_datetime(end_date)
+y_end_date = y_start_date + pd.DateOffset(years=30)
+
+# more dates - the date when the rate expires
+sofr_dt = y_start_date + pd.DateOffset(days=1)
+dgs3mo_dt = y_start_date + pd.DateOffset(months=3)
+dgs6mo_dt = y_start_date + pd.DateOffset(months=6)
+dgs1_dt = y_start_date + pd.DateOffset(years=1)
+dgs2_dt = y_start_date + pd.DateOffset(years=2)
+dgs5_dt = y_start_date + pd.DateOffset(years=5)
+dgs10_dt = y_start_date + pd.DateOffset(years=10)
+dgs20_dt = y_start_date + pd.DateOffset(years=20)
+dgs30_dt = y_start_date + pd.DateOffset(years=30)
+
+# lists to be used in the loop below
+series_id_list = ["SOFR", "DGS3MO", "DGS6MO", "DGS1", "DGS2", "DGS5", "DGS10", "DGS20", "DGS30"]
+series_dates_list = [sofr_dt, dgs3mo_dt, dgs6mo_dt, dgs1_dt, dgs2_dt, dgs5_dt, dgs10_dt, dgs20_dt, dgs30_dt]
+
+#create core rate dictionary
+core_rates = {'date': [], 'rate': []}
+
+for i in range(len(series_id_list)):
+    url = f"https://api.stlouisfed.org/fred/series/observations?series_id={series_id_list[i]}&api_key={api_key}&file_type=json&observation_start={start_date}&observation_end={end_date}"
+
+    response = requests.get(url)
+    data = response.json()
+
+    for observation in data['observations']:
+        core_rates["date"].append(series_dates_list[i])
+        core_rates["rate"].append(float(observation['value']) / 100.0)
+
+
+# Time-based interpolation - build a 30 year daily yield curve
+df = pd.DataFrame(core_rates)
+df.set_index('date', inplace=True)
+df_daily = df.resample('D').asfreq() # .asfreq() explicitly fills with NaNs
+df_interpolated_time = df_daily.interpolate(method='time')
+
+# create a csv
+df_interpolated_time.to_csv(output)
+
+## loan_data
+--loan_data_tbl
+CREATE
+OR REPLACE VIEW funworkspacedb.data_analytics.loan_data AS
+-- NOTE:THAT THE FOLLOWING VIEW DEFAULTS
+WITH payables_corrections AS (
+    -- Corrects the largest differences between Mosaic and the servicer
+    SELECT
+        payable_uuid,
+        gross_amt,
+        concord_reporting_uuid
+    FROM
+        funworkspacedb.data_analytics.payables_to_concord_corrections
+),
+preprocess_payables AS (
+    SELECT
+        p.payable_uuid,
+        p.application_uuid,
+        p.opportunity_id,
+        p.loan_id,
+        p.project_id,
+        p.gross_amt,
+        p.dealer_fee_amt,
+        p.net_amt,
+        p.payable_status,
+        p.transaction_code,
+        p.transaction_description,
+        p.milestone,
+        p.milestone_name,
+        p.payor_uuid,
+        p.payor_name,
+        p.payor_type,
+        p.recipient_uuid,
+        p.recipient_name,
+        p.recipient_type,
+        p.created_ts,
+        p.estimated_processing_dt,
+        p.milestone_complete_ts,
+        p.admin,
+        p.admin_notes,
+        p.data_source,
+        p.contract_uuid,
+        p.project_uuid,
+        CASE
+            WHEN c.payable_uuid IS NOT NULL THEN c.concord_reporting_uuid
+            ELSE p.concord_reporting_uuid
+        END AS concord_reporting_uuid,
+        p._last_modified_ts,
+        COALESCE(sl.original_amount, la.loan_amount) AS loan_amount
+    FROM
+        legacydb.data_warehouse.dim_payable AS p
+        LEFT JOIN payables_corrections AS c ON p.payable_uuid = c.payable_uuid
+        LEFT JOIN legacydb.reporting.tbl_static_loan AS sl ON sl.loan_id = p.loan_id
+        LEFT JOIN legacydb.src_platform_mosaic_live.loan AS l ON l.id = p.loan_id
+        INNER JOIN legacydb.src_platform_mosaic_live.loan_agreement AS la ON la.id = l.loan_agreement_id
+    WHERE
+        p.transaction_code IN ('P001', 'P002', 'P003')
+        AND p.payable_status NOT IN ('Cancelled', 'Held')
+),
+sequences_and_funding AS (
+    SELECT
+        l.id AS loan_id,
+        pp.opportunity_id,
+        ds.date_opportunity_created,
+        pp.estimated_processing_dt AS last_milestone_funding_date,
+        CASE
+            WHEN ds.disb_flag_m3 > 0 THEN 3
+            WHEN ds.disb_flag_m2 > 0 THEN 2
+            WHEN ds.disb_flag_m1 > 0 THEN 1
+            ELSE 0
+        END AS last_milestone_scheduled,
+        pp.milestone AS last_milestone_completed_raw,
+        CAST(
+            LAST_VALUE(pp.milestone) IGNORE NULLS OVER (
+                PARTITION BY pp.loan_id
+                ORDER BY
+                    pp.estimated_processing_dt ASC,
+                    pp.milestone DESC ROWS BETWEEN UNBOUNDED PRECEDING
+                    AND CURRENT ROW
+            ) AS INT
+        ) AS last_milestone_completed,
+        COALESCE(
+            ds.disb_flag_m0 + ds.disb_flag_m1 + ds.disb_flag_m2 + ds.disb_flag_m3,
+            0
+        ) AS total_num_scheduled_disbursements,
+        ds.disbursement_sequence_name,
+        ds.m0_disb_seq_decimal,
+        ds.m1_disb_seq_decimal,
+        ds.m2_disb_seq_decimal,
+        ds.m3_disb_seq_decimal,
+        pp.loan_amount,
+        SUM(pp.gross_amt) OVER (
+            PARTITION BY pp.loan_id
+            ORDER BY
+                pp.estimated_processing_dt
+        ) AS cum_sum_gross_amt,
+        pp.loan_amount - SUM(pp.gross_amt) OVER (
+            PARTITION BY pp.loan_id
+            ORDER BY
+                pp.estimated_processing_dt
+        ) AS cum_unfunded_amt,
+        SUM(pp.dealer_fee_amt) OVER (
+            PARTITION BY pp.loan_id
+            ORDER BY
+                pp.estimated_processing_dt
+        ) AS cum_sum_df_amt,
+        SUM(pp.net_amt) OVER (
+            PARTITION BY pp.loan_id
+            ORDER BY
+                pp.estimated_processing_dt
+        ) AS cum_sum_net_amt,
+        ROW_NUMBER() OVER (
+            PARTITION BY pp.opportunity_id
+            ORDER BY
+                pp.estimated_processing_dt DESC
+        ) AS rn
+    FROM
+        legacydb.src_platform_mosaic_live.loan AS l
+        LEFT JOIN preprocess_payables AS pp ON l.id = pp.loan_id
+        JOIN funworkspacedb.data_analytics.disbursement_sequences AS ds ON ds.opportunity_id = pp.opportunity_id
+    WHERE
+        pp.concord_reporting_uuid IS NOT NULL
+        AND pp.estimated_processing_dt <= '2024-03-01'--'2023-04-29' --AND pp.estimated_processing_dt <= CURRENT_DATE() - 1  -- run backwards by adjusting this date
+),
+final_calc AS (
+    SELECT
+        loan_id,
+        opportunity_id,
+        date_opportunity_created,
+        last_milestone_funding_date,
+        last_milestone_scheduled,
+        last_milestone_completed,
+        total_num_scheduled_disbursements,
+        disbursement_sequence_name,
+        m0_disb_seq_decimal,
+        m1_disb_seq_decimal,
+        m2_disb_seq_decimal,
+        m3_disb_seq_decimal,
+        loan_amount,
+        cum_sum_gross_amt,
+        cum_unfunded_amt,
+        ROUND(m0_disb_seq_decimal * loan_amount, 2) AS m0_disb_amt,
+        ROUND(m1_disb_seq_decimal * loan_amount, 2) AS m1_disb_amt,
+        ROUND(m2_disb_seq_decimal * loan_amount, 2) AS m2_disb_amt,
+        ROUND(m3_disb_seq_decimal * loan_amount, 2) AS m3_disb_amt
+        /* remaining scheduled disbursements count (exactly as your logic) */,
+        CASE
+            WHEN last_milestone_completed = 3
+            OR ROUND(cum_unfunded_amt, 0) = 0 THEN 0
+            WHEN last_milestone_completed = last_milestone_scheduled THEN 0
+            WHEN last_milestone_completed = 0
+            AND cum_sum_gross_amt <> 0 THEN 1
+            ELSE last_milestone_scheduled - last_milestone_completed
+        END AS total_num_scheduled_disbursements_remaining
+        /* helper indices for remaining-amount flags */,
+        COALESCE(last_milestone_completed, -1) AS last_comp_idx,
+        GREATEST(
+            0,
+            last_milestone_scheduled - (total_num_scheduled_disbursements - 1)
+        ) AS sch_start_idx,
+        last_milestone_scheduled AS sch_end_idx
+    FROM
+        sequences_and_funding QUALIFY rn = 1 -- pick latest row per opportunity
+),
+prev_month_balance AS (
+    SELECT
+        tbal.mosaic_loan_id,
+        tbal.current_balance
+    FROM
+        legacydb.servicer.concord_daily_trial_balance AS tbal
+    WHERE
+        effective_date = '2024-02-01'--'2023-03-29'
+        --WHERE effective_date = DATEADD('month', -1, DATEADD('day', -1, CURRENT_DATE()))
+)
+SELECT
+    risk.loan_id, -- dates
+    CAST(fc.date_opportunity_created AS DATE) AS opportunity_created_date,
+    tbal.effective_date,
+    tbal.promo_end_date,
+    tbal.choice_target_date,
+    tbal.first_payment_date,
+    tbal.origination_date,
+    tbal.current_maturity_date AS maturity_date,
+    tbal.cancel_date,
+    tbal.chargeoff_date,
+    CASE
+        WHEN tbal.account_code = 'P' THEN tbal.date_paid_off
+        ELSE NULL
+    END AS paidoff_date,
+    tbal.interest_paid_to_date,
+    tbal.interest_suspension_start_date,
+    tbal.interest_suspension_end_date, -- opening balance info
+    tbal.current_balance,
+    COALESCE(prev_month_balance.current_balance,0) AS previous_month_balance,
+    tbal.interest_receivable,
+    tbal.deferred_interest_balance,
+    tbal.late_charge_balance AS total_fees,
+    tbal.choice_balance AS choice_target_amount,
+    tbal.principal_advanced_amount,
+    tbal.loan_amount,
+    COALESCE(tbal.delinquent_amount, 0) AS arrears_amount, -- characteristics
+    ds.disbursement_sequence_name,
+    risk.original_dealer_id,
+    risk.product_meta_category AS product_category,
+    cp.account_tier,
+    CASE
+        WHEN risk.fico BETWEEN 0
+        AND 599 THEN '0-599'
+        WHEN risk.fico BETWEEN 600
+        AND 640 THEN '600-640'
+        WHEN risk.fico BETWEEN 641
+        AND 670 THEN '641-670'
+        WHEN risk.fico BETWEEN 671
+        AND 740 THEN '671-740'
+        WHEN risk.fico BETWEEN 741
+        AND 795 THEN '741-795'
+        ELSE '796+'
+    END AS fico_band,
+    tbal.developer,
+    tbal.project,
+    risk.loan_month_term,
+    risk.loan_month_term - COALESCE(risk.promo_period, 0) AS loan_period_months,
+    COALESCE(risk.promo_period, 0) AS promo_period,
+    CASE
+        WHEN tbal.account_code = 'T'
+        AND tbal.chargeoff_date IS NOT NULL THEN 4 -- COF
+        WHEN tbal.account_code = 'P'
+        AND tbal.current_balance = 0 THEN 6 -- PIF
+        WHEN tbal.account_code = 'C'
+        AND tbal.cancel_date IS NOT NULL THEN 5 -- CAN
+        WHEN tbal.days_delinquent <= 29 THEN 0
+        WHEN tbal.days_delinquent BETWEEN 30
+        AND 59 THEN 1
+        WHEN tbal.days_delinquent BETWEEN 60
+        AND 89 THEN 2
+        WHEN tbal.days_delinquent BETWEEN 90
+        AND 119 THEN 3
+        WHEN tbal.days_delinquent > 119 THEN 4
+    END AS current_state,
+    COALESCE(tbal.number_of_payments_delinquent, 0) AS number_of_payments_arrears, -- flags & rates
+    IFF(tbal.account_code = 'A', 1, 0) AS ach_flag,
+    (tbal.current_interest_rate / 100) AS interest_rate,
+    tbal.current_monthly_payment,
+    loan.standard_monthly_payment, -- outstanding disbursements (carry-through)
+    fc.last_milestone_completed,
+    fc.last_milestone_scheduled,
+    fc.total_num_scheduled_disbursements,
+    COALESCE(
+        fc.total_num_scheduled_disbursements_remaining,
+        0
+    ) AS total_num_scheduled_disbursements_remaining,
+    fc.last_milestone_funding_date,
+    COALESCE(
+        ds.m0_disb_seq_decimal,
+        fc.m0_disb_seq_decimal,
+        0
+    ) AS m0_disb_seq_decimal,
+    COALESCE(
+        ds.m1_disb_seq_decimal,
+        fc.m1_disb_seq_decimal,
+        0
+    ) AS m1_disb_seq_decimal,
+    COALESCE(
+        ds.m2_disb_seq_decimal,
+        fc.m2_disb_seq_decimal,
+        0
+    ) AS m2_disb_seq_decimal,
+    COALESCE(
+        ds.m3_disb_seq_decimal,
+        fc.m3_disb_seq_decimal,
+        0
+    ) AS m3_disb_seq_decimal,
+    COALESCE(
+        fc.cum_sum_gross_amt,
+        tbal.principal_advanced_amount
+    ) AS cum_sum_gross_amt,
+    COALESCE(fc.cum_unfunded_amt, 0) AS cum_unfunded_amt, -- remaining disbursement dollar amounts
+    CASE
+        WHEN fc.total_num_scheduled_disbursements_remaining = 0
+        OR tbal.cancel_date IS NOT NULL
+        OR tbal.chargeoff_date IS NOT NULL THEN 0
+        ELSE IFF(
+            0 BETWEEN fc.sch_start_idx
+            AND fc.sch_end_idx
+            AND 0 > fc.last_comp_idx,
+            fc.m0_disb_amt,
+            0
+        )
+    END AS m0_remaining_disb_amt,
+    CASE
+        WHEN fc.total_num_scheduled_disbursements_remaining = 0
+        OR tbal.cancel_date IS NOT NULL
+        OR tbal.chargeoff_date IS NOT NULL THEN 0
+        ELSE IFF(
+            1 BETWEEN fc.sch_start_idx
+            AND fc.sch_end_idx
+            AND 1 > fc.last_comp_idx,
+            fc.m1_disb_amt,
+            0
+        )
+    END AS m1_remaining_disb_amt,
+    CASE
+        WHEN fc.total_num_scheduled_disbursements_remaining = 0
+        OR tbal.cancel_date IS NOT NULL
+        OR tbal.chargeoff_date IS NOT NULL THEN 0
+        ELSE IFF(
+            2 BETWEEN fc.sch_start_idx
+            AND fc.sch_end_idx
+            AND 2 > fc.last_comp_idx,
+            fc.m2_disb_amt,
+            0
+        )
+    END AS m2_remaining_disb_amt,
+    CASE
+        WHEN fc.total_num_scheduled_disbursements_remaining = 0
+        OR tbal.cancel_date IS NOT NULL
+        OR tbal.chargeoff_date IS NOT NULL THEN 0
+        ELSE IFF(
+            3 BETWEEN fc.sch_start_idx
+            AND fc.sch_end_idx
+            AND 3 > fc.last_comp_idx,
+            fc.m3_disb_amt,
+            0
+        )
+    END AS m3_remaining_disb_amt,
+    CASE
+        WHEN tbal.account_code = 'T' THEN DATEDIFF(
+            'month',
+            tbal.chargeoff_date,
+            tbal.effective_date
+        )
+        ELSE NULL
+    END AS months_since_co,
+    DATEDIFF(
+        'month',
+        tbal.origination_date,
+        tbal.effective_date
+    ) AS months_since_origination,
+    CASE
+        WHEN ROUND(
+            DATEDIFF(
+                'month',
+                tbal.origination_date,
+                tbal.effective_date
+            ),
+            0
+        ) BETWEEN 4
+        AND 6 THEN CAST('4-6' AS VARCHAR)
+        WHEN ROUND(
+            DATEDIFF(
+                'month',
+                tbal.origination_date,
+                tbal.effective_date
+            ),
+            0
+        ) BETWEEN 7
+        AND 12 THEN CAST('7-12' AS VARCHAR)
+        WHEN ROUND(
+            DATEDIFF(
+                'month',
+                tbal.origination_date,
+                tbal.effective_date
+            ),
+            0
+        ) BETWEEN 13
+        AND 18 THEN CAST('13-18' AS VARCHAR)
+        WHEN ROUND(
+            DATEDIFF(
+                'month',
+                tbal.origination_date,
+                tbal.effective_date
+            ),
+            0
+        ) BETWEEN 19
+        AND 24 THEN CAST('19-24' AS VARCHAR)
+        WHEN ROUND(
+            DATEDIFF(
+                'month',
+                tbal.origination_date,
+                tbal.effective_date
+            ),
+            0
+        ) BETWEEN 25
+        AND 36 THEN CAST('25-36' AS VARCHAR)
+        WHEN ROUND(
+            DATEDIFF(
+                'month',
+                tbal.origination_date,
+                tbal.effective_date
+            ),
+            0
+        ) BETWEEN 37
+        AND 48 THEN CAST('37-48' AS VARCHAR)
+        WHEN ROUND(
+            DATEDIFF(
+                'month',
+                tbal.origination_date,
+                tbal.effective_date
+            ),
+            0
+        ) BETWEEN 49
+        AND 60 THEN CAST('49-60' AS VARCHAR)
+        WHEN ROUND(
+            DATEDIFF(
+                'month',
+                tbal.origination_date,
+                tbal.effective_date
+            ),
+            0
+        ) > 60 THEN CAST('61+' AS VARCHAR)
+        ELSE CAST('0-3' AS VARCHAR)
+    END AS age_bucket
+FROM
+    legacydb.servicer.concord_daily_trial_balance AS tbal
+    LEFT JOIN legacydb.reporting.tbl_static_loan AS risk 
+      ON tbal.mosaic_loan_id = risk.loan_id
+    LEFT JOIN legacydb.src_platform_mosaic_live.loan 
+      ON loan.id = risk.loan_id
+    LEFT JOIN legacydb.src_platform_mosaic_live.opportunity AS opp 
+      ON opp.id = risk.opportunity_id
+    LEFT JOIN legacydb.src_platform_mosaic_live.channel_partner AS cp 
+      ON cp.id = risk.original_dealer_id
+    LEFT JOIN funworkspacedb.data_analytics.disbursement_sequences AS ds 
+      ON ds.opportunity_id = risk.opportunity_id
+    LEFT JOIN final_calc AS fc 
+      ON fc.opportunity_id = risk.opportunity_id
+    LEFT JOIN prev_month_balance 
+      ON prev_month_balance.mosaic_loan_id = risk.loan_id
+WHERE
+    tbal.effective_date = '2024-03-01'--'2023-04-29' --test
+  AND tbal.cancel_date IS NULL
+  AND tbal.chargeoff_date IS NULL
+  AND tbal.current_balance > 0
+  AND tbal.mosaic_loan_id IN (395927,415487) --370007,369865,369880); --test
+    --WHERE tbal.effective_date = CURRENT_DATE() - 1
+--ORDER BY RANDOM()
+--LIMIT 50;
+
+## portfolio_metrics
+--portfolio_metrics_tbl
+/*
+The following code creates the transition rates
+*/
+CREATE OR REPLACE VIEW funworkspacedb.data_analytics.transition_rates_data AS
+-- NOTE:THAT THE FOLLOWING VIEW DEFAULTS 
+WITH adjusted_delinquency_buckets AS (
+  SELECT
+    dynamic.report_date
+    , dynamic.loan_id
+    , CASE
+        WHEN dynamic.prior_delq_bucket IN ('TRNSFR', '1-9DPD', '10-29DPD', 'CUR', 'NOA') THEN '0-29DPD'
+        ELSE dynamic.prior_delq_bucket
+      END AS adjusted_prior_delq_bkt
+    , CASE
+      WHEN dynamic.delq_bucket IN ('TRNSFR', '1-9DPD', '10-29DPD', 'CUR', 'NOA') THEN '0-29DPD'
+      ELSE dynamic.delq_bucket
+    END AS adjusted_delq_bkt
+  FROM legacydb.reporting.tbl_dynamic_loan AS dynamic
+),
+fico_buckets AS (
+  SELECT
+    static.loan_id
+    , CASE 
+          WHEN static.fico BETWEEN 0 AND 599 THEN '0-599'
+          WHEN static.fico BETWEEN 600 AND 640 THEN '600-640'
+          WHEN static.fico BETWEEN 641 AND 670 THEN '641-670'
+          WHEN static.fico BETWEEN 671 AND 740 THEN '671-740'
+          WHEN static.fico BETWEEN 741 AND 795 THEN '741-795'
+          ELSE '796+'
+      END AS fico_band
+  FROM legacydb.reporting.tbl_static_loan AS static
+),
+loan_age AS (
+SELECT
+	s.loan_id
+	, d.report_date
+	, CASE
+		WHEN DATEDIFF('month', s.origination_date, d.report_date) BETWEEN 4 AND 6 
+            THEN CAST('4-6' AS VARCHAR)
+		WHEN DATEDIFF('month', s.origination_date, d.report_date) BETWEEN 7 AND 12 
+            THEN CAST('7-12' AS VARCHAR)
+		WHEN DATEDIFF('month', s.origination_date, d.report_date) BETWEEN 13 AND 18 
+            THEN CAST('13-18' AS VARCHAR)
+		WHEN DATEDIFF('month', s.origination_date, d.report_date) BETWEEN 19 AND 24 
+            THEN CAST('19-24' AS VARCHAR)
+		WHEN DATEDIFF('month', s.origination_date, d.report_date) BETWEEN 25 AND 36 
+            THEN CAST('25-36' AS VARCHAR)
+		WHEN DATEDIFF('month', s.origination_date, d.report_date) BETWEEN 37 AND 48 
+            THEN CAST('37-48' AS VARCHAR)
+		WHEN DATEDIFF('month', s.origination_date, d.report_date) BETWEEN 49 AND 60 
+            THEN CAST('49-60' AS VARCHAR)
+		WHEN DATEDIFF('month', s.origination_date, d.report_date) > 60 
+            THEN CAST('61+' AS VARCHAR)
+		ELSE CAST('0-3' AS VARCHAR)
+	END AS num_months
+FROM legacydb.reporting.tbl_dynamic_loan AS d
+LEFT JOIN legacydb.reporting.tbl_static_loan AS s
+  ON s.loan_id = d.loan_id
+),
+pre_raw_performance_data AS (
+    SELECT
+        dynamic.report_date,  
+        static.loan_id,
+        cp.account_tier AS channel_partner_tier,
+        --*********************************************************************************************
+        -- 0-3, 4-6, 7-12, 13-18, 19-24, 25-36, 37-48, 49-60, 61+
+        --*********************************************************************************************        
+        loan_age.num_months,     
+        static.product_meta_category AS product_category,
+        COALESCE(static.promo_period, 0) AS promo_period,
+        adjusted_delinquency_buckets.adjusted_prior_delq_bkt,
+        adjusted_delinquency_buckets.adjusted_delq_bkt,  
+        fico_buckets.fico_band,
+        --*********************************************************************************************
+        -- 0 = 0-29, 1 = 30-59, 2 = 60-89, 3 = 90-119, 4 = 120+, 5 = cancel, 6 = paid-in-full, 9 = other
+        --*********************************************************************************************
+        /*
+         0 - 29
+         */
+        CASE
+            WHEN adjusted_delinquency_buckets.adjusted_prior_delq_bkt = '0-29DPD'
+            	AND adjusted_delinquency_buckets.adjusted_delq_bkt = '0-29DPD' THEN 1
+            ELSE 0
+        END AS stay_0_0,
+        CASE
+            WHEN adjusted_delinquency_buckets.adjusted_prior_delq_bkt = '0-29DPD' 
+            	AND adjusted_delinquency_buckets.adjusted_delq_bkt = '30-59DPD' THEN 1
+            ELSE 0
+        END AS roll_0_1,
+        CASE
+            WHEN adjusted_delinquency_buckets.adjusted_prior_delq_bkt = '0-29DPD' 
+            	AND adjusted_delinquency_buckets.adjusted_delq_bkt = '60-89DPD' THEN 1
+            ELSE 0
+        END AS roll_0_2,
+        CASE
+            WHEN adjusted_delinquency_buckets.adjusted_prior_delq_bkt = '0-29DPD' 
+            	AND adjusted_delinquency_buckets.adjusted_delq_bkt = '90-119DPD' THEN 1
+            ELSE 0
+        END AS roll_0_3,        
+        CASE
+            WHEN adjusted_delinquency_buckets.adjusted_prior_delq_bkt = '0-29DPD'
+            	AND adjusted_delinquency_buckets.adjusted_delq_bkt = 'CNL' THEN 1
+            ELSE 0
+        END AS roll_0_5, --terminal    
+        --END AS can_0_can,
+        CASE
+            WHEN adjusted_delinquency_buckets.adjusted_prior_delq_bkt = '0-29DPD'
+            	AND adjusted_delinquency_buckets.adjusted_delq_bkt IN ('COF', '120DPD+') THEN 1
+            ELSE 0
+        END AS roll_0_4, --terminal  
+        CASE
+            WHEN adjusted_delinquency_buckets.adjusted_prior_delq_bkt = '0-29DPD'
+            	AND adjusted_delinquency_buckets.adjusted_delq_bkt = 'PIF' THEN 1
+            ELSE 0
+        END AS roll_0_6, --terminal  
+        CASE
+            WHEN adjusted_delinquency_buckets.adjusted_prior_delq_bkt = '0-29DPD'
+            	AND adjusted_delinquency_buckets.adjusted_delq_bkt NOT IN ('30-59DPD','PIF','0-29DPD','COF','CNL','60-89DPD','90-119DPD','120DPD+') THEN 1
+            ELSE 0
+        END AS roll_0_9, --> most troubling state - there s/b 3 terminal states but NO state IS 100% terminal.
+        /*
+         30 - 59
+         */
+        CASE
+            WHEN adjusted_delinquency_buckets.adjusted_prior_delq_bkt = '30-59DPD' 
+            	AND adjusted_delinquency_buckets.adjusted_delq_bkt = '30-59DPD' THEN 1
+            ELSE 0
+        END AS stay_1_1, 
+        CASE
+            WHEN adjusted_delinquency_buckets.adjusted_prior_delq_bkt = '30-59DPD' 
+            	AND adjusted_delinquency_buckets.adjusted_delq_bkt = '0-29DPD' THEN 1
+            ELSE 0
+        END AS cure_1_0,
+        CASE
+            WHEN adjusted_delinquency_buckets.adjusted_prior_delq_bkt = '30-59DPD' 
+            	AND adjusted_delinquency_buckets.adjusted_delq_bkt = '60-89DPD' THEN 1
+            ELSE 0
+        END AS roll_1_2,
+        CASE
+            WHEN adjusted_delinquency_buckets.adjusted_prior_delq_bkt = '30-59DPD' 
+            	AND adjusted_delinquency_buckets.adjusted_delq_bkt = '90-119DPD' THEN 1
+            ELSE 0
+        END AS roll_1_3,        
+        CASE
+            WHEN adjusted_delinquency_buckets.adjusted_prior_delq_bkt = '30-59DPD'
+            	AND adjusted_delinquency_buckets.adjusted_delq_bkt = 'CNL' THEN 1
+            ELSE 0
+        END AS roll_1_5, -- terminal
+        CASE
+            WHEN adjusted_delinquency_buckets.adjusted_prior_delq_bkt = '30-59DPD'
+            	AND adjusted_delinquency_buckets.adjusted_delq_bkt IN ('COF', '120DPD+') THEN 1
+            ELSE 0
+        END AS roll_1_4, -- terminal
+        CASE
+            WHEN adjusted_delinquency_buckets.adjusted_prior_delq_bkt = '30-59DPD'
+            	AND adjusted_delinquency_buckets.adjusted_delq_bkt = 'PIF' THEN 1
+            ELSE 0
+        END AS roll_1_6, -- terminal
+        CASE
+            WHEN adjusted_delinquency_buckets.adjusted_prior_delq_bkt = '30-59DPD'
+            	AND adjusted_delinquency_buckets.adjusted_delq_bkt NOT IN ('0-29DPD','PIF','30-59DPD','COF','60-89DPD','CNL','90-119DPD','120DPD+') THEN 1
+            ELSE 0
+        END AS roll_1_9,        
+        /*
+         60 - 89
+         */
+        CASE
+            WHEN adjusted_delinquency_buckets.adjusted_prior_delq_bkt = '60-89DPD' 
+              AND adjusted_delinquency_buckets.adjusted_delq_bkt = '60-89DPD' THEN 1
+            ELSE 0
+        END AS stay_2_2,
+        CASE
+            WHEN adjusted_delinquency_buckets.adjusted_prior_delq_bkt = '60-89DPD' 
+              AND adjusted_delinquency_buckets.adjusted_delq_bkt = '30-59DPD' THEN 1
+            ELSE 0
+        END AS cure_2_1,
+        CASE
+            WHEN adjusted_delinquency_buckets.adjusted_prior_delq_bkt = '60-89DPD' 
+              AND adjusted_delinquency_buckets.adjusted_delq_bkt = '0-29DPD' THEN 1
+            ELSE 0
+        END AS cure_2_0,
+        CASE
+            WHEN adjusted_delinquency_buckets.adjusted_prior_delq_bkt = '60-89DPD' 
+              AND adjusted_delinquency_buckets.adjusted_delq_bkt = '90-119DPD' THEN 1
+            ELSE 0
+        END AS roll_2_3,
+        CASE
+            WHEN adjusted_delinquency_buckets.adjusted_prior_delq_bkt = '60-89DPD'
+            	AND adjusted_delinquency_buckets.adjusted_delq_bkt = 'CNL' THEN 1
+            ELSE 0
+        END AS roll_2_5, -- terminal
+        CASE
+            WHEN adjusted_delinquency_buckets.adjusted_prior_delq_bkt = '60-89DPD'
+            	AND adjusted_delinquency_buckets.adjusted_delq_bkt IN ('COF', '120DPD+') THEN 1
+            ELSE 0
+        END AS roll_2_4, -- terminal
+        CASE
+            WHEN adjusted_delinquency_buckets.adjusted_prior_delq_bkt = '60-89DPD'
+            	AND adjusted_delinquency_buckets.adjusted_delq_bkt = 'PIF' THEN 1
+            ELSE 0
+        END AS roll_2_6, -- terminal
+        CASE
+            WHEN adjusted_delinquency_buckets.adjusted_prior_delq_bkt = '60-89DPD'
+            	AND adjusted_delinquency_buckets.adjusted_delq_bkt NOT IN ('60-89DPD','PIF','30-59DPD','COF','0-29DPD','CNL','90-119DPD','120DPD+') THEN 1
+            ELSE 0
+        END AS roll_2_9,  
+        /*
+        90 - 120
+         */
+        CASE
+            WHEN adjusted_delinquency_buckets.adjusted_prior_delq_bkt = '90-119DPD' 
+              AND adjusted_delinquency_buckets.adjusted_delq_bkt = '90-119DPD' THEN 1
+            ELSE 0
+        END AS stay_3_3,
+        CASE
+            WHEN adjusted_delinquency_buckets.adjusted_prior_delq_bkt = '90-119DPD' 
+              AND adjusted_delinquency_buckets.adjusted_delq_bkt = '0-29DPD' THEN 1
+            ELSE 0
+        END AS cure_3_0,
+        CASE
+            WHEN adjusted_delinquency_buckets.adjusted_prior_delq_bkt = '90-119DPD' 
+              AND adjusted_delinquency_buckets.adjusted_delq_bkt = '30-59DPD' THEN 1
+            ELSE 0
+        END AS cure_3_1,
+        CASE
+            WHEN adjusted_delinquency_buckets.adjusted_prior_delq_bkt = '90-119DPD' 
+              AND adjusted_delinquency_buckets.adjusted_delq_bkt = '60-89DPD' THEN 1
+            ELSE 0
+        END AS cure_3_2,
+        CASE
+            WHEN adjusted_delinquency_buckets.adjusted_prior_delq_bkt = '90-119DPD' 
+              AND adjusted_delinquency_buckets.adjusted_delq_bkt IN ('COF', '120DPD+') THEN 1
+            ELSE 0
+        END AS roll_3_4,
+        CASE
+            WHEN adjusted_delinquency_buckets.adjusted_prior_delq_bkt = '90-119DPD'
+            	AND adjusted_delinquency_buckets.adjusted_delq_bkt = 'CAN' THEN 1
+            ELSE 0
+        END AS roll_3_5,
+        CASE
+            WHEN adjusted_delinquency_buckets.adjusted_prior_delq_bkt = '90-119DPD'
+            	AND adjusted_delinquency_buckets.adjusted_delq_bkt = 'PIF' THEN 1
+            ELSE 0
+        END AS roll_3_6,
+        CASE
+            WHEN adjusted_delinquency_buckets.adjusted_prior_delq_bkt = '90-119DPD'
+            	AND adjusted_delinquency_buckets.adjusted_delq_bkt NOT IN ('60-89DPD','PIF','30-59DPD','COF','0-29DPD','CNL','90-119DPD','120DPD+') THEN 1
+            ELSE 0
+        END AS roll_3_9,
+        /*
+        120+ --> TERMINAL
+         */
+         CASE
+            WHEN adjusted_delinquency_buckets.adjusted_prior_delq_bkt = '120DPD+' THEN 1
+            ELSE 0
+        END AS stay_4_4,
+        /*
+        CANCEL --> TERMINAL
+         */
+         CASE
+            WHEN adjusted_delinquency_buckets.adjusted_prior_delq_bkt = 'CNL' THEN 1
+            ELSE 0
+        END AS stay_5_5,
+        /*
+        PIF --> TERMINAL
+         */
+         CASE
+            WHEN adjusted_delinquency_buckets.adjusted_prior_delq_bkt = 'PIF' THEN 1
+            ELSE 0
+        END AS stay_6_6
+    FROM legacydb.reporting.tbl_dynamic_loan AS dynamic
+    LEFT JOIN legacydb.reporting.tbl_static_loan AS static 
+      ON dynamic.loan_id = static.loan_id
+    LEFT JOIN adjusted_delinquency_buckets
+      ON adjusted_delinquency_buckets.report_date = dynamic.report_date
+     AND adjusted_delinquency_buckets.loan_id = dynamic.loan_id
+    LEFT JOIN fico_buckets
+      ON fico_buckets.loan_id = dynamic.loan_id
+    LEFT JOIN legacydb.src_platform_mosaic_live.channel_partner AS cp
+      ON cp.id = static.original_dealer_id
+    LEFT JOIN loan_age
+      ON dynamic.loan_id = loan_age.loan_id
+     AND dynamic.report_date = loan_age.report_date
+   WHERE dynamic.report_date >= LAST_DAY(ADD_MONTHS(SYSDATE(), - 61)) --> DATA FOR the LAST 18 months.
+),
+raw_performance_data AS (
+SELECT
+  d.report_date
+  , d.loan_id
+  , d.num_months AS age_bucket
+  , d.product_category
+  , d.promo_period
+  , d.fico_band
+  , d.channel_partner_tier
+          /*
+           0 - 29
+           */
+  , d.stay_0_0
+  , d.roll_0_1
+  , d.roll_0_2
+  , d.roll_0_3
+  , d.roll_0_4 --> terminal cof
+  , d.roll_0_5 --> terminal cancel
+  , d.roll_0_6 --> terminal pif
+  , d.roll_0_9 --> other
+          /*
+           30 - 59
+           */
+  , d.stay_1_1
+  , d.cure_1_0
+  , d.roll_1_2
+  , d.roll_1_3
+  , d.roll_1_4 --> terminal cof
+  , d.roll_1_5 --> terminal cancel
+  , d.roll_1_6 --> terminal pif
+  , d.roll_1_9 --> other  
+          /*
+           60 - 89
+           */
+  , d.stay_2_2
+  , d.cure_2_1
+  , d.cure_2_0
+  , d.roll_2_3
+  , d.roll_2_4 --> terminal cof
+  , d.roll_2_5 --> terminal cancel
+  , d.roll_2_6 --> terminal pif
+  , d.roll_2_9 --> other 
+          /*
+          90 - 120
+           */
+  , d.stay_3_3
+  , d.cure_3_0
+  , d.cure_3_1
+  , d.cure_3_2
+  , d.roll_3_4 --> terminal cof
+  , d.roll_3_5 --> terminal cancel
+  , d.roll_3_6 --> terminal pif
+  , d.roll_3_9 --> other
+          /*
+          120+
+           */
+  , d.stay_4_4
+          /*
+          cancel
+           */
+  , d.stay_5_5
+          /*
+          pif
+           */
+  , d.stay_6_6
+FROM pre_raw_performance_data AS d
+),
+numerator_for_roll_rate AS (
+SELECT
+  raw_data.age_bucket --> DELEETE
+  --, raw_data.vintage
+  , raw_data.product_category
+  , raw_data.promo_period
+  , raw_data.channel_partner_tier
+  , raw_data.fico_band
+  , SUM(raw_data.stay_0_0) AS stay_0_0
+  , SUM(raw_data.roll_0_1) AS roll_0_1
+  , SUM(raw_data.roll_0_2) AS roll_0_2
+  , SUM(raw_data.roll_0_3) AS roll_0_3   
+  , SUM(raw_data.roll_0_5) AS roll_0_5
+  , SUM(raw_data.roll_0_4) AS roll_0_4
+  , SUM(raw_data.roll_0_6) AS roll_0_6
+  , SUM(raw_data.roll_0_9) AS roll_0_9
+  /*
+   30 - 59
+   */
+  , SUM(raw_data.stay_1_1) AS stay_1_1
+  , SUM(raw_data.cure_1_0) AS cure_1_0
+  , SUM(raw_data.roll_1_2) AS roll_1_2
+  , SUM(raw_data.roll_1_3) AS roll_1_3    
+  , SUM(raw_data.roll_1_5) AS roll_1_5 
+  , SUM(raw_data.roll_1_4) AS roll_1_4
+  , SUM(raw_data.roll_1_6) AS roll_1_6
+  , SUM(raw_data.roll_1_9) AS roll_1_9   
+  /*
+   60 - 89
+   */
+  , SUM(raw_data.stay_2_2) AS stay_2_2
+  , SUM(raw_data.cure_2_1) AS cure_2_1
+  , SUM(raw_data.cure_2_0) AS cure_2_0
+  , SUM(raw_data.roll_2_3) AS roll_2_3 
+  , SUM(raw_data.roll_2_5) AS roll_2_5
+  , SUM(raw_data.roll_2_4) AS roll_2_4
+  , SUM(raw_data.roll_2_6) AS roll_2_6 
+  , SUM(raw_data.roll_2_9) AS roll_2_9
+  /*
+  90 - 120
+   */
+  , SUM(raw_data.stay_3_3) AS stay_3_3
+  , SUM(raw_data.cure_3_1) AS cure_3_1
+  , SUM(raw_data.cure_3_2) AS cure_3_2   
+  , SUM(raw_data.cure_3_0) AS cure_3_0
+  , SUM(raw_data.roll_3_5) AS roll_3_5
+  , SUM(raw_data.roll_3_4) AS roll_3_4
+  , SUM(raw_data.roll_3_6) AS roll_3_6 
+  , SUM(raw_data.roll_3_9) AS roll_3_9
+  /*
+  120+
+   */
+  , SUM(raw_data.stay_4_4) AS stay_4_4
+  /*
+  can
+   */
+  , SUM(raw_data.stay_5_5) AS stay_5_5
+  /*
+  pif
+   */
+  , SUM(raw_data.stay_6_6) AS stay_6_6
+FROM raw_performance_data AS raw_data
+GROUP BY 1, 2, 3, 4, 5
+),
+denominator_for_roll_rate AS (
+SELECT
+  raw_data.age_bucket
+  --, raw_data.vintage
+  , raw_data.product_category
+  , raw_data.promo_period
+  , raw_data.channel_partner_tier
+  , raw_data.fico_band
+  , (SUM(raw_data.stay_0_0)
+   + SUM(raw_data.roll_0_1)
+   + SUM(raw_data.roll_0_2)
+   + SUM(raw_data.roll_0_3)   
+   + SUM(raw_data.roll_0_5)
+   + SUM(raw_data.roll_0_4)
+   + SUM(raw_data.roll_0_6)
+   + SUM(raw_data.roll_0_9)
+    ) AS _0_total
+  /*
+   30 - 59
+   */
+  , (SUM(raw_data.stay_1_1)
+   + SUM(raw_data.cure_1_0)
+   + SUM(raw_data.roll_1_2)
+   + SUM(raw_data.roll_1_3)   
+   + SUM(raw_data.roll_1_5)
+   + SUM(raw_data.roll_1_4)
+   + SUM(raw_data.roll_1_6)
+   + SUM(raw_data.roll_1_9)
+    ) AS _1_total   
+  /*
+   60 - 89
+   */
+  , (SUM(raw_data.stay_2_2)
+   + SUM(raw_data.cure_2_1)
+   + SUM(raw_data.cure_2_0)
+   + SUM(raw_data.roll_2_3)
+   + SUM(raw_data.roll_2_5)
+   + SUM(raw_data.roll_2_4)
+   + SUM(raw_data.roll_2_6) 
+   + SUM(raw_data.roll_2_9)
+    ) AS _2_total
+  /*
+  90 - 120
+   */
+  , (SUM(raw_data.stay_3_3)
+   + SUM(raw_data.cure_3_1)
+   + SUM(raw_data.cure_3_2)   
+   + SUM(raw_data.cure_3_0)
+   + SUM(raw_data.roll_3_5)
+   + SUM(raw_data.roll_3_4)
+   + SUM(raw_data.roll_3_6) 
+   + SUM(raw_data.roll_3_9) 
+    ) AS _3_total
+  /*
+  120+
+   */
+  , SUM(raw_data.stay_4_4) AS _4_total
+  /*
+  can
+   */
+  , SUM(raw_data.stay_5_5) AS _5_total
+  /*
+  pif
+   */
+  , SUM(raw_data.stay_6_6)  AS _6_total
+FROM raw_performance_data AS raw_data
+GROUP BY 1, 2, 3, 4, 5
+),
+intermediate_roll_rates AS (
+SELECT
+  n.age_bucket
+  , n.product_category
+  , n.promo_period
+  , n.channel_partner_tier
+  , n.fico_band
+  /*
+   0 - 29
+   */
+  , CAST(n.stay_0_0 * 1.0 / NULLIF(d._0_total, 0) AS DECIMAL(18,11)) AS stay_0_0_rr
+  , CAST(n.roll_0_1 * 1.0 / NULLIF(d._0_total, 0) AS DECIMAL(18,11)) AS roll_0_1_rr
+  , CAST(n.roll_0_2 * 1.0 / NULLIF(d._0_total, 0) AS DECIMAL(18,11)) AS roll_0_2_rr
+  , CAST(n.roll_0_3 * 1.0 / NULLIF(d._0_total, 0) AS DECIMAL(18,11)) AS roll_0_3_rr
+  , CAST(n.roll_0_4 * 1.0 / NULLIF(d._0_total, 0) AS DECIMAL(18,11)) AS roll_0_4_rr
+  , CAST(n.roll_0_5 * 1.0 / NULLIF(d._0_total, 0) AS DECIMAL(18,11)) AS roll_0_5_rr
+  , CAST(n.roll_0_6 * 1.0 / NULLIF(d._0_total, 0) AS DECIMAL(18,11)) AS roll_0_6_rr
+  , CAST(n.roll_0_9 * 1.0 / NULLIF(d._0_total, 0) AS DECIMAL(18,11)) AS roll_0_9_rr  
+  /*
+   30 - 59
+   */
+  , CAST(n.stay_1_1 * 1.0 / NULLIF(d._1_total, 0) AS DECIMAL(18,11)) AS stay_1_1_rr
+  , CAST(n.cure_1_0 * 1.0 / NULLIF(d._1_total, 0) AS DECIMAL(18,11)) AS cure_1_0_rr
+  , CAST(n.roll_1_2 * 1.0 / NULLIF(d._1_total, 0) AS DECIMAL(18,11)) AS roll_1_2_rr
+  , CAST(n.roll_1_3 * 1.0 / NULLIF(d._1_total, 0) AS DECIMAL(18,11)) AS roll_1_3_rr
+  , CAST(n.roll_1_4 * 1.0 / NULLIF(d._1_total, 0) AS DECIMAL(18,11)) AS roll_1_4_rr
+  , CAST(n.roll_1_5 * 1.0 / NULLIF(d._1_total, 0) AS DECIMAL(18,11)) AS roll_1_5_rr
+  , CAST(n.roll_1_6 * 1.0 / NULLIF(d._1_total, 0) AS DECIMAL(18,11)) AS roll_1_6_rr
+  , CAST(n.roll_1_9 * 1.0 / NULLIF(d._1_total, 0) AS DECIMAL(18,11)) AS roll_1_9_rr   
+  /*
+   60 - 89
+   */
+  , CAST(n.stay_2_2 * 1.0 / NULLIF(d._2_total, 0) AS DECIMAL(18,11)) AS stay_2_2_rr
+  , CAST(n.cure_2_0 * 1.0 / NULLIF(d._2_total, 0) AS DECIMAL(18,11)) AS cure_2_0_rr
+  , CAST(n.cure_2_1 * 1.0 / NULLIF(d._2_total, 0) AS DECIMAL(18,11)) AS cure_2_1_rr
+  , CAST(n.roll_2_3 * 1.0 / NULLIF(d._2_total, 0) AS DECIMAL(18,11)) AS roll_2_3_rr
+  , CAST(n.roll_2_4 * 1.0 / NULLIF(d._2_total, 0) AS DECIMAL(18,11)) AS roll_2_4_rr
+  , CAST(n.roll_2_5 * 1.0 / NULLIF(d._2_total, 0) AS DECIMAL(18,11)) AS roll_2_5_rr
+  , CAST(n.roll_2_6 * 1.0 / NULLIF(d._2_total, 0) AS DECIMAL(18,11)) AS roll_2_6_rr
+  , CAST(n.roll_2_9 * 1.0 / NULLIF(d._2_total, 0) AS DECIMAL(18,11)) AS roll_2_9_rr  
+  /*
+  90 - 120
+   */
+  , CAST(n.stay_3_3 * 1.0 / NULLIF(d._3_total, 0) AS DECIMAL(18,11)) AS stay_3_3_rr
+  , CAST(n.cure_3_0 * 1.0 / NULLIF(d._3_total, 0) AS DECIMAL(18,11)) AS cure_3_0_rr
+  , CAST(n.cure_3_1 * 1.0 / NULLIF(d._3_total, 0) AS DECIMAL(18,11)) AS cure_3_1_rr
+  , CAST(n.cure_3_2 * 1.0 / NULLIF(d._3_total, 0) AS DECIMAL(18,11)) AS cure_3_2_rr
+  , CAST(n.roll_3_4 * 1.0 / NULLIF(d._3_total, 0) AS DECIMAL(18,11)) AS roll_3_4_rr
+  , CAST(n.roll_3_5 * 1.0 / NULLIF(d._3_total, 0) AS DECIMAL(18,11)) AS roll_3_5_rr
+  , CAST(n.roll_3_6 * 1.0 / NULLIF(d._3_total, 0) AS DECIMAL(18,11)) AS roll_3_6_rr
+  , CAST(n.roll_3_9 * 1.0 / NULLIF(d._3_total, 0) AS DECIMAL(18,11)) AS roll_3_9_rr 
+  /*
+  120+
+  */
+  , 1 AS stay_4_4_rr
+  , 0 AS cure_4_3_rr
+  , 0 AS cure_4_2_rr
+  , 0 AS cure_4_1_rr
+  , 0 AS cure_4_0_rr
+  , 0 AS roll_4_5_rr
+  , 0 AS roll_4_6_rr
+  , 0 AS roll_4_9_rr
+  /*
+  cancel
+  */
+  , 1 AS stay_5_5_rr
+  , 0 AS cure_5_3_rr
+  , 0 AS cure_5_2_rr
+  , 0 AS cure_5_1_rr
+  , 0 AS cure_5_0_rr
+  , 0 AS cure_5_4_rr
+  , 0 AS roll_5_6_rr
+  , 0 AS roll_5_9_rr
+  /*
+  paid_in_full
+  */
+  , 1 AS stay_6_6_rr
+  , 0 AS cure_6_3_rr
+  , 0 AS cure_6_2_rr
+  , 0 AS cure_6_1_rr
+  , 0 AS cure_6_0_rr
+  , 0 AS cure_6_4_rr
+  , 0 AS cure_6_5_rr
+  , 0 AS roll_6_9_rr  
+FROM numerator_for_roll_rate AS n
+LEFT JOIN denominator_for_roll_rate AS d
+  ON n.product_category = d.product_category
+ AND n.promo_period = d.promo_period
+ AND n.channel_partner_tier = d.channel_partner_tier
+ AND n.fico_band = d.fico_band
+ AND n.age_bucket = d.age_bucket
+),
+final_data AS (
+SELECT 
+	r.age_bucket
+  , r.product_category
+  , r.promo_period
+  , r.channel_partner_tier
+  , r.fico_band
+  , 0 AS present_state
+  , 0 AS future_state
+  , COALESCE(r.stay_0_0_rr, 0) AS rates
+FROM intermediate_roll_rates AS r
+UNION ALL
+SELECT 
+	r.age_bucket
+  , r.product_category
+  , r.promo_period
+  , r.channel_partner_tier
+  , r.fico_band
+  , 0 AS present_state
+  , 1 AS future_state
+  , COALESCE(r.roll_0_1_rr, 0) AS rates
+FROM intermediate_roll_rates AS r
+UNION ALL
+SELECT 
+	r.age_bucket
+  , r.product_category
+  , r.promo_period
+  , r.channel_partner_tier
+  , r.fico_band
+  , 0 AS present_state
+  , 2 AS future_state
+  , COALESCE(r.roll_0_2_rr, 0) AS rates
+FROM intermediate_roll_rates AS r
+UNION ALL
+SELECT 
+	r.age_bucket
+  , r.product_category
+  , r.promo_period
+  , r.channel_partner_tier
+  , r.fico_band
+  , 0 AS present_state
+  , 3 AS future_state
+  , COALESCE(r.roll_0_3_rr, 0) AS rates
+FROM intermediate_roll_rates AS r
+UNION ALL
+SELECT 
+	r.age_bucket
+  , r.product_category
+  , r.promo_period
+  , r.channel_partner_tier
+  , r.fico_band
+  , 0 AS present_state
+  , 4 AS future_state
+  , COALESCE(r.roll_0_4_rr, 0) AS rates
+FROM intermediate_roll_rates AS r
+UNION ALL
+SELECT 
+  	r.age_bucket
+  , r.product_category
+  , r.promo_period
+  , r.channel_partner_tier
+  , r.fico_band
+  , 0 AS present_state
+  , 5 AS future_state
+  , COALESCE(r.roll_0_5_rr, 0) AS rates
+FROM intermediate_roll_rates AS r
+UNION ALL
+SELECT 
+  	r.age_bucket
+  , r.product_category
+  , r.promo_period
+  , r.channel_partner_tier
+  , r.fico_band
+  , 0 AS present_state
+  , 6 AS future_state
+  , COALESCE(r.roll_0_6_rr, 0) AS rates
+FROM intermediate_roll_rates AS r
+UNION ALL
+SELECT 
+  	r.age_bucket
+  , r.product_category
+  , r.promo_period
+  , r.channel_partner_tier
+  , r.fico_band
+  , 0 AS present_state
+  , 9 AS future_state
+  , COALESCE(r.roll_0_9_rr, 0) AS rates
+FROM intermediate_roll_rates AS r
+UNION ALL
+SELECT 
+  r.age_bucket
+  , r.product_category
+  , r.promo_period
+  , r.channel_partner_tier
+  , r.fico_band
+  , 1 AS present_state
+  , 1 AS future_state
+  , COALESCE(r.stay_1_1_rr, 0) AS rates
+FROM intermediate_roll_rates AS r
+UNION ALL
+SELECT
+	r.age_bucket
+  , r.product_category
+  , r.promo_period
+  , r.channel_partner_tier
+  , r.fico_band
+  , 1 AS present_state
+  , 0 AS future_state
+  , COALESCE(r.cure_1_0_rr, 0) AS rates
+FROM intermediate_roll_rates AS r
+UNION ALL
+SELECT 
+	r.age_bucket
+  , r.product_category
+  , r.promo_period
+  , r.channel_partner_tier
+  , r.fico_band
+  , 1 AS present_state
+  , 2 AS future_state
+  , COALESCE(r.roll_1_2_rr, 0) AS rates
+FROM intermediate_roll_rates AS r
+UNION ALL
+SELECT 
+	r.age_bucket
+  , r.product_category
+  , r.promo_period
+  , r.channel_partner_tier
+  , r.fico_band
+  , 1 AS present_state
+  , 3 AS future_state
+  , COALESCE(r.roll_1_3_rr, 0) AS rates
+FROM intermediate_roll_rates AS r
+UNION ALL
+SELECT 
+	r.age_bucket
+  , r.product_category
+  , r.promo_period
+  , r.channel_partner_tier
+  , r.fico_band
+  , 1 AS present_state
+  , 4 AS future_state
+  , COALESCE(r.roll_1_4_rr, 0) AS rates
+FROM intermediate_roll_rates AS r
+UNION ALL
+SELECT
+  	r.age_bucket
+  , r.product_category
+  , r.promo_period
+  , r.channel_partner_tier
+  , r.fico_band
+  , 1 AS present_state
+  , 5 AS future_state
+  , COALESCE(r.roll_1_5_rr, 0) AS rates
+FROM intermediate_roll_rates AS r
+UNION ALL
+SELECT 
+	r.age_bucket
+  , r.product_category
+  , r.promo_period
+  , r.channel_partner_tier
+  , r.fico_band
+  , 1 AS present_state
+  , 6 AS future_state
+  , COALESCE(r.roll_1_6_rr, 0) AS rates
+FROM intermediate_roll_rates AS r
+UNION ALL
+SELECT 
+	r.age_bucket
+  , r.product_category
+  , r.promo_period
+  , r.channel_partner_tier
+  , r.fico_band
+  , 1 AS present_state
+  , 9 AS future_state
+  , COALESCE(r.roll_1_9_rr, 0) AS rates
+FROM intermediate_roll_rates AS r
+UNION ALL
+SELECT 
+	r.age_bucket
+  , r.product_category
+  , r.promo_period
+  , r.channel_partner_tier
+  , r.fico_band
+  , 2 AS present_state
+  , 2 AS future_state
+  , COALESCE(r.stay_2_2_rr, 0) AS rates
+FROM intermediate_roll_rates AS r
+UNION ALL
+SELECT 
+	r.age_bucket
+  , r.product_category
+  , r.promo_period
+  , r.channel_partner_tier
+  , r.fico_band
+  , 2 AS present_state
+  , 0 AS future_state
+  , COALESCE(r.cure_2_0_rr, 0) AS rates
+FROM intermediate_roll_rates AS r
+UNION ALL
+SELECT 
+	r.age_bucket
+  , r.product_category
+  , r.promo_period
+  , r.channel_partner_tier
+  , r.fico_band
+  , 2 AS present_state
+  , 1 AS future_state
+  , COALESCE(r.cure_2_1_rr, 0) AS rates
+FROM intermediate_roll_rates AS r
+UNION ALL
+SELECT 
+	r.age_bucket
+  , r.product_category
+  , r.promo_period
+  , r.channel_partner_tier
+  , r.fico_band
+  , 2 AS present_state
+  , 3 AS future_state
+  , COALESCE(r.roll_2_3_rr, 0) AS rates
+FROM intermediate_roll_rates AS r
+UNION ALL
+SELECT 
+	r.age_bucket
+  , r.product_category
+  , r.promo_period
+  , r.channel_partner_tier
+  , r.fico_band
+  , 2 AS present_state
+  , 4 AS future_state
+  , COALESCE(r.roll_2_4_rr, 0) AS rates
+FROM intermediate_roll_rates AS r
+UNION ALL
+SELECT 
+	r.age_bucket
+  , r.product_category
+  , r.promo_period
+  , r.channel_partner_tier
+  , r.fico_band
+  , 2 AS present_state
+  , 5 AS future_state
+  , COALESCE(r.roll_2_5_rr, 0) AS rates
+FROM intermediate_roll_rates AS r
+UNION ALL
+SELECT 
+	r.age_bucket
+  , r.product_category
+  , r.promo_period
+  , r.channel_partner_tier
+  , r.fico_band
+  , 2 AS present_state
+  , 6 AS future_state
+  , COALESCE(r.roll_2_6_rr, 0) AS rates
+FROM intermediate_roll_rates AS r
+UNION ALL
+SELECT 
+	r.age_bucket
+  , r.product_category
+  , r.promo_period
+  , r.channel_partner_tier
+  , r.fico_band
+  , 2 AS present_state
+  , 9 AS future_state
+  , COALESCE(r.roll_2_9_rr, 0) AS rates
+FROM intermediate_roll_rates AS r
+UNION ALL
+SELECT 
+	r.age_bucket
+  , r.product_category
+  , r.promo_period
+  , r.channel_partner_tier
+  , r.fico_band
+  , 3 AS present_state
+  , 3 AS future_state
+  , COALESCE(r.stay_3_3_rr, 0) AS rates
+FROM intermediate_roll_rates AS r
+UNION ALL
+SELECT 
+	r.age_bucket
+  , r.product_category
+  , r.promo_period
+  , r.channel_partner_tier
+  , r.fico_band
+  , 3 AS present_state
+  , 0 AS future_state
+  , COALESCE(r.cure_3_0_rr, 0) AS rates
+FROM intermediate_roll_rates AS r
+UNION ALL
+SELECT 
+	r.age_bucket
+  , r.product_category
+  , r.promo_period
+  , r.channel_partner_tier
+  , r.fico_band
+  , 3 AS present_state
+  , 1 AS future_state
+  , COALESCE(r.cure_3_1_rr, 0) AS rates
+FROM intermediate_roll_rates AS r
+UNION ALL
+SELECT 
+	r.age_bucket
+  , r.product_category
+  , r.promo_period
+  , r.channel_partner_tier
+  , r.fico_band
+  , 3 AS present_state
+  , 2 AS future_state
+  , COALESCE(r.cure_3_2_rr, 0) AS rates
+FROM intermediate_roll_rates AS r
+UNION ALL
+SELECT 
+	r.age_bucket
+  , r.product_category
+  , r.promo_period
+  , r.channel_partner_tier
+  , r.fico_band
+  , 3 AS present_state
+  , 4 AS future_state
+  , COALESCE(r.roll_3_4_rr, 0) AS rates
+FROM intermediate_roll_rates AS r
+UNION ALL
+SELECT 
+	r.age_bucket	
+  , r.product_category
+  , r.promo_period
+  , r.channel_partner_tier
+  , r.fico_band
+  , 3 AS present_state
+  , 5 AS future_state
+  , COALESCE(r.roll_3_5_rr, 0) AS rates
+FROM intermediate_roll_rates AS r
+UNION ALL
+SELECT 
+	r.age_bucket		
+  , r.product_category
+  , r.promo_period
+  , r.channel_partner_tier
+  , r.fico_band
+  , 3 AS present_state
+  , 6 AS future_state
+  , COALESCE(r.roll_3_6_rr, 0) AS rates
+FROM intermediate_roll_rates AS r
+UNION ALL
+SELECT 
+	r.age_bucket
+  , r.product_category
+  , r.promo_period
+  , r.channel_partner_tier
+  , r.fico_band
+  , 3 AS present_state
+  , 9 AS future_state
+  , COALESCE(r.roll_3_9_rr, 0) AS rates
+FROM intermediate_roll_rates AS r
+UNION ALL
+SELECT
+	r.age_bucket
+  , r.product_category
+  , r.promo_period
+  , r.channel_partner_tier
+  , r.fico_band
+  , 4 AS present_state
+  , 4 AS future_state
+  , COALESCE(r.stay_4_4_rr, 0) AS rates
+FROM intermediate_roll_rates AS r
+UNION ALL
+SELECT 
+	r.age_bucket
+  , r.product_category
+  , r.promo_period
+  , r.channel_partner_tier
+  , r.fico_band
+  , 4 AS present_state
+  , 3 AS future_state
+  , COALESCE(r.cure_4_3_rr, 0) AS rates
+FROM intermediate_roll_rates AS r
+UNION ALL
+SELECT 
+	r.age_bucket
+  , r.product_category
+  , r.promo_period
+  , r.channel_partner_tier
+  , r.fico_band
+  , 4 AS present_state
+  , 2 AS future_state
+  , COALESCE(r.cure_4_2_rr, 0) AS rates
+FROM intermediate_roll_rates AS r
+UNION ALL
+SELECT 
+	r.age_bucket
+  , r.product_category
+  , r.promo_period
+  , r.channel_partner_tier
+  , r.fico_band
+  , 4 AS present_state
+  , 1 AS future_state
+  , COALESCE(r.cure_4_1_rr, 0) AS rates
+FROM intermediate_roll_rates AS r
+UNION ALL
+SELECT
+	r.age_bucket
+  , r.product_category
+  , r.promo_period
+  , r.channel_partner_tier
+  , r.fico_band
+  , 4 AS present_state
+  , 0 AS future_state
+  , COALESCE(r.cure_4_0_rr, 0) AS rates
+FROM intermediate_roll_rates AS r
+UNION ALL
+SELECT 
+	r.age_bucket
+  , r.product_category
+  , r.promo_period
+  , r.channel_partner_tier
+  , r.fico_band
+  , 4 AS present_state
+  , 5 AS future_state
+  , COALESCE(r.roll_4_5_rr, 0) AS rates
+FROM intermediate_roll_rates AS r
+UNION ALL
+SELECT 
+	r.age_bucket
+  , r.product_category
+  , r.promo_period
+  , r.channel_partner_tier
+  , r.fico_band
+  , 4 AS present_state
+  , 6 AS future_state
+  , COALESCE(r.roll_4_6_rr, 0) AS rates
+FROM intermediate_roll_rates AS r
+UNION ALL
+SELECT 
+	r.age_bucket
+  , r.product_category
+  , r.promo_period
+  , r.channel_partner_tier
+  , r.fico_band
+  , 4 AS present_state
+  , 9 AS future_state
+  , COALESCE(r.roll_4_9_rr, 0) AS rates
+FROM intermediate_roll_rates AS r
+UNION ALL
+SELECT 
+	r.age_bucket
+  , r.product_category
+  , r.promo_period
+  , r.channel_partner_tier
+  , r.fico_band
+  , 5 AS present_state
+  , 5 AS future_state
+  , COALESCE(r.stay_5_5_rr, 0) AS rates
+FROM intermediate_roll_rates AS r
+UNION ALL
+SELECT 
+	r.age_bucket
+  , r.product_category
+  , r.promo_period
+  , r.channel_partner_tier
+  , r.fico_band
+  , 5 AS present_state
+  , 3 AS future_state
+  , COALESCE(r.cure_5_3_rr, 0) AS rates
+FROM intermediate_roll_rates AS r
+UNION ALL
+SELECT 
+	r.age_bucket
+  , r.product_category
+  , r.promo_period
+  , r.channel_partner_tier
+  , r.fico_band
+  , 5 AS present_state
+  , 2 AS future_state
+  , COALESCE(r.cure_5_2_rr, 0) AS rates
+FROM intermediate_roll_rates AS r
+UNION ALL
+SELECT 
+	r.age_bucket
+  , r.product_category
+  , r.promo_period
+  , r.channel_partner_tier
+  , r.fico_band
+  , 5 AS present_state
+  , 1 AS future_state
+  , COALESCE(r.cure_5_1_rr, 0) AS rates
+FROM intermediate_roll_rates AS r
+UNION ALL
+SELECT 
+	r.age_bucket
+  , r.product_category
+  , r.promo_period
+  , r.channel_partner_tier
+  , r.fico_band
+  , 5 AS present_state
+  , 0 AS future_state
+  , COALESCE(r.cure_5_0_rr, 0) AS rates
+FROM intermediate_roll_rates AS r
+UNION ALL
+SELECT 
+	r.age_bucket
+  , r.product_category
+  , r.promo_period
+  , r.channel_partner_tier
+  , r.fico_band
+  , 5 AS present_state
+  , 4 AS future_state
+  , COALESCE(r.cure_5_4_rr, 0) AS rates
+FROM intermediate_roll_rates AS r
+UNION ALL
+SELECT 
+	r.age_bucket
+  , r.product_category
+  , r.promo_period
+  , r.channel_partner_tier
+  , r.fico_band
+  , 5 AS present_state
+  , 6 AS future_state
+  , COALESCE(r.roll_5_6_rr, 0) AS rates
+FROM intermediate_roll_rates AS r
+UNION ALL
+SELECT 
+	r.age_bucket
+  , r.product_category
+  , r.promo_period
+  , r.channel_partner_tier
+  , r.fico_band
+  , 5 AS present_state
+  , 9 AS future_state
+  , COALESCE(r.roll_5_9_rr, 0) AS rates
+FROM intermediate_roll_rates AS r
+UNION ALL
+SELECT 
+	r.age_bucket
+  , r.product_category
+  , r.promo_period
+  , r.channel_partner_tier
+  , r.fico_band
+  , 6 AS present_state
+  , 6 AS future_state
+  , COALESCE(r.stay_6_6_rr, 0) AS rates
+FROM intermediate_roll_rates AS r
+UNION ALL
+SELECT 
+	r.age_bucket
+  , r.product_category
+  , r.promo_period
+  , r.channel_partner_tier
+  , r.fico_band
+  , 6 AS present_state
+  , 3 AS future_state
+  , COALESCE(r.cure_6_3_rr, 0) AS rates
+FROM intermediate_roll_rates AS r
+UNION ALL
+SELECT 
+	r.age_bucket
+  , r.product_category
+  , r.promo_period
+  , r.channel_partner_tier
+  , r.fico_band
+  , 6 AS present_state
+  , 2 AS future_state
+  , COALESCE(r.cure_6_2_rr, 0) AS rates
+FROM intermediate_roll_rates AS r
+UNION ALL
+SELECT 
+	r.age_bucket
+  , r.product_category
+  , r.promo_period
+  , r.channel_partner_tier
+  , r.fico_band
+  , 6 AS present_state
+  , 1 AS future_state
+  , COALESCE(r.cure_6_1_rr, 0) AS rates
+FROM intermediate_roll_rates AS r
+UNION ALL
+SELECT 
+	r.age_bucket
+  , r.product_category
+  , r.promo_period
+  , r.channel_partner_tier
+  , r.fico_band
+  , 6 AS present_state
+  , 0 AS future_state
+  , COALESCE(r.cure_6_0_rr, 0) AS rates
+FROM intermediate_roll_rates AS r
+UNION ALL
+SELECT 
+	r.age_bucket
+  , r.product_category
+  , r.promo_period
+  , r.channel_partner_tier
+  , r.fico_band
+  , 6 AS present_state
+  , 4 AS future_state
+  , COALESCE(r.cure_6_4_rr, 0) AS rates
+FROM intermediate_roll_rates AS r
+UNION ALL
+SELECT
+	r.age_bucket
+  , r.product_category
+  , r.promo_period
+  , r.channel_partner_tier
+  , r.fico_band
+  , 6 AS present_state
+  , 5 AS future_state
+  , COALESCE(r.cure_6_5_rr, 0) AS rates
+FROM intermediate_roll_rates AS r
+UNION ALL
+SELECT 
+	r.age_bucket
+  , r.product_category
+  , r.promo_period
+  , r.channel_partner_tier
+  , r.fico_band
+  , 6 AS present_state
+  , 9 AS future_state
+  , COALESCE(r.roll_6_9_rr, 0) AS rates
+FROM intermediate_roll_rates AS r
+)
+--*********************************************************************************************
+-- code for days past due, cancel, c/o (120+) or pif 
+-- 0 = 0-29, 1 = 30-59, 2 = 60-89, 3 = 90-119, 4 = 120+, 5 = cancel, 6 = paid-in-full, 9 = other
+--*********************************************************************************************
+SELECT
+	age_bucket
+  , product_category
+  , promo_period
+  , channel_partner_tier
+  , fico_band
+  , present_state --AS current_state
+  , future_state --AS next_state
+  , rates
+FROM final_data;
+
+
+/*
+*/
+/*
+The following code creates the table that details how loan the loan took to get from
+the opportunity creation date to the various milestone.
+*/
+CREATE OR REPLACE VIEW funworkspacedb.data_analytics.milestone_timing_data AS
+-- NOTE:THAT THE FOLLOWING VIEW DEFAULTS
+WITH payables_corrections AS (
+-- this file corrects the largest differences between mosaic and servicer
+SELECT
+    corrections.payable_uuid
+    , corrections.gross_amt
+    , corrections.concord_reporting_uuid
+FROM funworkspacedb.data_analytics.payables_to_concord_corrections AS corrections
+),
+mosaic_advances AS (
+SELECT
+    dim_payable.loan_id
+    , tbl_static_loan.opportunity_id
+    , dim_payable.milestone
+    , CAST(dim_payable.milestone_complete_ts AS DATE) AS milestone_complete_date
+    , SUM(dim_payable.gross_amt) AS amount_of_principal_advance
+FROM legacydb.data_warehouse.dim_payable AS dim_payable
+LEFT JOIN payables_corrections
+  ON dim_payable.payable_uuid = payables_corrections.payable_uuid
+LEFT JOIN legacydb.reporting.tbl_static_loan
+  ON tbl_static_loan.loan_id = dim_payable.loan_id
+WHERE dim_payable.transaction_code IN ('P001', 'P002', 'P003')
+ AND dim_payable.payable_status NOT IN ('Cancelled', 'Held')
+ AND dim_payable.milestone_complete_ts IS NOT NULL
+GROUP BY 1,2,3,4
+),
+static_loans_raw AS (
+SELECT
+	risk.opportunity_id
+	, risk.loan_id
+	, risk.installer_tier
+	, risk.product_meta_category
+	, disbursement_sequences.disbursement_sequence_name
+	, CASE WHEN risk.promo_period IS NOT NULL THEN risk.promo_period ELSE 0 END AS promo_period
+	, disbursement_sequences.date_opportunity_created
+	, CASE WHEN mosaic_advances.milestone = 0 THEN mosaic_advances.milestone_complete_date ELSE NULL END AS m0_date	
+	, CASE WHEN mosaic_advances.milestone = 1 THEN mosaic_advances.milestone_complete_date ELSE NULL END AS m1_date
+	, CASE WHEN mosaic_advances.milestone = 2 THEN mosaic_advances.milestone_complete_date ELSE NULL END AS m2_date
+	, CASE WHEN mosaic_advances.milestone = 3 THEN mosaic_advances.milestone_complete_date ELSE NULL END AS m3_date
+	, CASE WHEN mosaic_advances.milestone = 0 THEN mosaic_advances.amount_of_principal_advance ELSE NULL END AS m0_amt
+	, CASE WHEN mosaic_advances.milestone = 1 THEN mosaic_advances.amount_of_principal_advance ELSE NULL END AS m1_amt
+	, CASE WHEN mosaic_advances.milestone = 2 THEN mosaic_advances.amount_of_principal_advance ELSE NULL END AS m2_amt
+	, CASE WHEN mosaic_advances.milestone = 3 THEN mosaic_advances.amount_of_principal_advance ELSE NULL END AS m3_amt
+FROM legacydb.reporting.tbl_static_loan AS risk
+LEFT JOIN mosaic_advances
+  ON mosaic_advances.opportunity_id = risk.opportunity_id
+LEFT JOIN funworkspacedb.data_analytics.disbursement_sequences
+  ON disbursement_sequences.opportunity_id = risk.opportunity_id
+WHERE risk.final_funding_date BETWEEN DATEADD('year', -2, CURRENT_DATE) AND CURRENT_DATE --> FINAL funding during LAST 2 years
+),
+static_loans_flat AS (
+SELECT
+	opportunity_id
+	, loan_id
+	, installer_tier
+	, product_meta_category
+	, disbursement_sequence_name
+	, promo_period
+	, date_opportunity_created
+	, MAX(m0_date) AS m0_date
+	, MAX(m1_date) AS m1_date
+	, MAX(m2_date) AS m2_date
+	, MAX(m3_date) AS m3_date
+	, SUM(m0_amt) AS m0_amt
+	, SUM(m1_amt) AS m1_amt
+	, SUM(m2_amt) AS m2_amt
+	, SUM(m3_amt) AS m3_amt	
+FROM static_loans_raw
+GROUP BY 1, 2, 3, 4, 5, 6, 7
+),
+static_loan_clean AS (
+SELECT 
+	opportunity_id
+	, loan_id
+	, installer_tier
+	, product_meta_category
+	, disbursement_sequence_name
+	, promo_period
+	, date_opportunity_created
+	, CASE WHEN m0_amt >= 0.02 THEN m0_date ELSE NULL END AS m0_date
+	, CASE WHEN m1_amt >= 0.02 THEN m1_date ELSE NULL END AS m1_date
+	, CASE WHEN m2_amt >= 0.02 THEN m2_date ELSE NULL END AS m2_date
+	, CASE WHEN m3_amt >= 0.02 THEN m3_date ELSE NULL END AS m3_date
+FROM static_loans_flat
+),
+data_tbl_raw AS (
+SELECT
+	opportunity_id
+	, loan_id
+	, installer_tier
+	, product_meta_category
+	, disbursement_sequence_name
+	, promo_period
+	, CASE WHEN m0_date IS NOT NULL THEN DATEDIFF('day', date_opportunity_created, m0_date) ELSE NULL END AS opp_to_m0
+	, CASE WHEN m1_date IS NOT NULL THEN DATEDIFF('day', date_opportunity_created, m1_date) ELSE NULL END AS opp_to_m1
+	, CASE WHEN m2_date IS NOT NULL THEN DATEDIFF('day', date_opportunity_created, m2_date) ELSE NULL END AS opp_to_m2
+	, CASE WHEN m3_date IS NOT NULL THEN DATEDIFF('day', date_opportunity_created, m3_date) ELSE NULL END AS opp_to_m3
+FROM static_loan_clean
+),
+data_tbl AS (
+SELECT
+	opportunity_id
+	, loan_id
+	, installer_tier
+	, product_meta_category
+	, disbursement_sequence_name
+	, promo_period
+	, CASE WHEN opp_to_m0 < 0 THEN NULL ELSE opp_to_m0 END AS opp_to_m0
+	, CASE WHEN opp_to_m1 < 0 THEN NULL ELSE opp_to_m1 END AS opp_to_m1
+	, CASE WHEN opp_to_m2 < 0 THEN NULL ELSE opp_to_m2 END AS opp_to_m2
+	, CASE WHEN opp_to_m3 < 0 THEN NULL ELSE opp_to_m3 END AS opp_to_m3
+FROM data_tbl_raw
+),
+milestone_unpivot AS (
+  SELECT
+    installer_tier,
+    product_meta_category,
+    disbursement_sequence_name,
+    promo_period,
+    0 AS to_milestone,
+    opp_to_m0 AS number_of_days
+  FROM data_tbl
+  WHERE opp_to_m0 IS NOT NULL
+  UNION ALL
+  SELECT
+    installer_tier,
+    product_meta_category,
+    disbursement_sequence_name,
+    promo_period,
+    1 AS to_milestone,
+    opp_to_m1 AS number_of_days
+  FROM data_tbl
+  WHERE opp_to_m1 IS NOT NULL
+  UNION ALL
+  SELECT
+    installer_tier,
+    product_meta_category,
+    disbursement_sequence_name,
+    promo_period,
+    2 AS to_milestone,
+    opp_to_m2 AS number_of_days
+  FROM data_tbl
+  WHERE opp_to_m2 IS NOT NULL
+  UNION ALL
+  SELECT
+    installer_tier,
+    product_meta_category,
+    disbursement_sequence_name,
+    promo_period,
+    3 AS to_milestone,
+    opp_to_m3 AS number_of_days
+  FROM data_tbl
+  WHERE opp_to_m3 IS NOT NULL
+),
+milestone_agg AS (
+  SELECT
+    installer_tier AS channel_partner_tier,
+    product_meta_category AS  product_category,
+    disbursement_sequence_name,
+    promo_period,
+    to_milestone,
+    AVG(number_of_days) AS avg_number_of_days
+  FROM milestone_unpivot
+  GROUP BY 1, 2, 3, 4, 5
+),
+default_agg AS (
+  SELECT
+    0 AS channel_partner_tier,
+    'none' AS product_category,
+    disbursement_sequence_name,
+    0 AS promo_period,
+    to_milestone,
+    AVG(number_of_days) AS avg_number_of_days
+  FROM milestone_unpivot
+  GROUP BY 1, 2, 3, 4, 5
+)
+SELECT * FROM milestone_agg
+UNION ALL
+SELECT * FROM default_agg;
+
+
+/*
+This is the recoveries smm. The smm begins the month the loan is c/o and collects
+prepayment information monthly.
+*/
+CREATE OR REPLACE VIEW funworkspacedb.data_analytics.charge_off_smm_data AS
+WITH co_data AS (
+SELECT
+	s.loan_id
+	, s.product_meta_category
+	, s.installer_tier
+	, s.chargeoff_date
+    , CASE
+          WHEN s.fico BETWEEN 0 AND 599 THEN '0-599'
+          WHEN s.fico BETWEEN 600 AND 640 THEN '600-640'
+          WHEN s.fico BETWEEN 641 AND 670 THEN '641-670'
+          WHEN s.fico BETWEEN 671 AND 740 THEN '671-740'
+          WHEN s.fico BETWEEN 741 AND 795 THEN '741-795'
+          ELSE '796+'
+      END AS fico_band
+FROM legacydb.reporting.tbl_static_loan AS s
+WHERE s.chargeoff_date IS NOT NULL
+),
+co_recoveries_raw AS (
+SELECT
+	d.report_date
+	, co_data.loan_id
+	, co_data.product_meta_category
+	, co_data.installer_tier
+	, co_data.fico_band
+	, d.principal_balance + COALESCE(d.accrued_unpaid_interest_balance, 0) + COALESCE(d.all_fees_amount, 0) AS recovery_principal_base
+	-- no scheduled payments once the loan in co status. No scheduled payments to include in smm calculation
+	--, d.accrued_unpaid_interest_balance --> ADD TO principal AS part OF the base
+	--, d.all_fees_amount --> ADD TO principal AS part OF the base
+	, COALESCE(d.principal_recovery_amount, 0) + COALESCE(d.interest_recovery_amount, 0) + COALESCE(d.fees_recovery_amount, 0) AS recovery_payment_base
+	--, d.interest_recovery_amount
+	--, d.fees_recovery_amount
+	, ROW_NUMBER() OVER (PARTITION BY co_data.loan_id ORDER BY d.report_date) - 1 AS num_months_after_co
+	, CASE WHEN d.principal_balance = 0 AND d.recovery_amount IS NULL THEN FALSE ELSE TRUE END AS include_flag --> WHEN the outstanding has been pif
+FROM co_data
+LEFT JOIN legacydb.reporting.tbl_dynamic_loan AS d
+  ON co_data.loan_id = d.loan_id
+ AND d.report_date >= co_data.chargeoff_date
+),
+co_recoveries AS (
+SELECT
+	report_date
+	, loan_id
+	, product_meta_category
+	, installer_tier
+	, fico_band
+	, ROUND(recovery_principal_base, 2) AS recovery_principal_base
+	, ROUND(COALESCE(LAG(recovery_principal_base, 1) OVER (PARTITION BY loan_id ORDER BY report_date), recovery_principal_base), 2) AS lag_recovery_principal_base
+	, recovery_payment_base
+	, num_months_after_co
+FROM co_recoveries_raw
+WHERE include_flag = TRUE --> removes the co that GET pid
+),
+smm_calculation AS (
+SELECT
+	report_date
+	, loan_id
+	, product_meta_category
+	, installer_tier
+	, fico_band
+	, recovery_payment_base	
+	, lag_recovery_principal_base
+	, CASE 
+		WHEN CAST(recovery_payment_base AS DECIMAL(18,8))  / NULLIF(lag_recovery_principal_base, 0) < 0
+			THEN 0
+		ELSE CAST(recovery_payment_base AS DECIMAL(18,8))  / NULLIF(lag_recovery_principal_base, 0)
+	END AS smm
+	, num_months_after_co
+FROM co_recoveries
+),
+final_data AS (
+SELECT
+	num_months_after_co AS months_since_co
+	, product_meta_category
+	, installer_tier
+	, fico_band
+	, COALESCE(AVG(smm), 0) AS avg_smm
+FROM smm_calculation
+GROUP BY 1,2,3,4
+)
+SELECT
+	months_since_co
+	, product_meta_category AS product_category
+	, installer_tier AS channel_partner_tier
+	, fico_band
+	, avg_smm
+FROM final_data
+ORDER BY 2,3,4,1;
+
+
+/*
+This is the smm for loans that are not charged off.
+*/
+CREATE OR REPLACE VIEW funworkspacedb.data_analytics.smm_data AS
+WITH loan_data AS (
+SELECT
+    d.report_date
+    , s.loan_id
+	, s.installer_tier
+    , COALESCE(s.promo_period, 0) AS promo_period
+    , s.product_meta_category
+    , CASE
+          WHEN s.fico BETWEEN 0 AND 599 THEN '0-599'
+          WHEN s.fico BETWEEN 600 AND 640 THEN '600-640'
+          WHEN s.fico BETWEEN 641 AND 670 THEN '641-670'
+          WHEN s.fico BETWEEN 671 AND 740 THEN '671-740'
+          WHEN s.fico BETWEEN 741 AND 795 THEN '741-795'
+          ELSE '796+'
+      END AS fico_band    
+    , COALESCE(d.prior_principal_balance, d.principal_balance) AS lag_principal_balance
+    , COALESCE(d.prepay, 0) AS prepay
+    , ROW_NUMBER() OVER (PARTITION BY s.loan_id ORDER BY d.report_date) - 1 AS num_months_after_origination
+FROM legacydb.reporting.tbl_static_loan AS s
+LEFT JOIN legacydb.reporting.tbl_dynamic_loan AS d
+  ON s.loan_id = d.loan_id
+),
+smm_calculation AS (
+SELECT
+	ld.report_date
+	, ld.loan_id
+	, ld.product_meta_category
+	, ld.installer_tier
+	, ld.fico_band
+	, ld.promo_period
+	, ld.prepay
+	, ld.lag_principal_balance
+	, CASE 
+		WHEN CAST(ld.prepay AS DECIMAL(18,8))  / NULLIF(ld.lag_principal_balance, 0) < 0
+			THEN 0
+		ELSE CAST(ld.prepay AS DECIMAL(18,8))  / NULLIF(ld.lag_principal_balance, 0)
+	END AS smm
+	, num_months_after_origination
+FROM loan_data AS ld
+),
+final_data AS (
+SELECT
+	num_months_after_origination AS months_since_origination
+	, promo_period
+	, product_meta_category
+	, installer_tier
+	, fico_band
+	, COALESCE(AVG(smm), 0) AS avg_smm
+FROM smm_calculation
+GROUP BY 1,2,3,4,5
+)
+SELECT
+	months_since_origination
+	, promo_period
+	, product_meta_category AS product_category
+	, installer_tier AS channel_partner_tier
+	, fico_band
+	, avg_smm
+FROM final_data
+ORDER BY 3,5,4,2,1;
+
+## create_output
+CREATE OR REPLACE TABLE FUNWORKSPACEDB.DATA_ANALYTICS.FORECAST_DAILY_LOAN_CASHFLOWS (
+  loan_id                                    number,
+  date                                       date,
+  current_balance                            NUMBER(36, 2),
+  accrued_interest                           NUMBER(36, 2),
+  deferred_interest_balance                  NUMBER(36, 2),
+  arrears_amount                             NUMBER(36, 2),
+  total_fees                                 NUMBER(36, 2),
+  missed_payments                            number,
+  charged_off                                boolean,
+  cancelled                                  boolean,
+  paid_in_full                               boolean,
+  cancellation_fee                           NUMBER(36, 2),
+  expected_payment                           NUMBER(36, 2),
+  payment_applied                            NUMBER(36, 2),
+  prepay_applied                             NUMBER(36, 2),
+  advance_applied                            NUMBER(36, 2),
+  choice_flag                                integer,
+  choice_prepay_amt                          NUMBER(36, 2),
+  cumulative_collection_agency_remittance    NUMBER(36, 2),
+  prev_state                                 number,
+  next_state                                 number,
+  --these fields are needed for the present value cacls
+  pv_initial_advance_applied                 NUMBER(36, 2),
+  pv_payment_applied                         NUMBER(36, 2),
+  pv_prepay_applied                          NUMBER(36, 2),
+  pv_advance_applied                         NUMBER(36, 2),
+  pv_cumulative_collection_agency_remittance NUMBER(36, 2)
+  --run_id                                    string
+);
+
+##imports and constraints
+# --- Imports
+import numpy as np
+import pandas as pd
+import calendar
+from datetime import date, datetime, timedelta
+from typing import List, Dict, Tuple
+from snowflake.snowpark import Session, Row
+from snowflake.snowpark.functions import col
+from snowflake.snowpark.types import (
+    StructType, StructField,
+    IntegerType, StringType, DateType, DoubleType, BooleanType
+)
+from bisect import bisect_left
+from bisect import bisect_right
+import uuid
+
+# --- tables --> created above
+T_LOANS   = "FUNWORKSPACEDB.DATA_ANALYTICS.LOAN_DATA"
+T_TRANS   = "FUNWORKSPACEDB.DATA_ANALYTICS.TRANSITION_RATES_DATA"
+T_SMM     = "FUNWORKSPACEDB.DATA_ANALYTICS.SMM_DATA"
+T_SMM_CO  = "FUNWORKSPACEDB.DATA_ANALYTICS.CHARGE_OFF_SMM_DATA"
+T_MILES   = "FUNWORKSPACEDB.DATA_ANALYTICS.MILESTONE_TIMING_DATA"
+
+# ---- Output targets ----
+T_OUT_DAILY  = "FUNWORKSPACEDB.DATA_ANALYTICS.FORECAST_DAILY_LOAN_CASHFLOWS"
+YIELD_CURVE_TBL = "FUNWORKSPACEDB.DATA_ANALYTICS.YIELD_CURVE"  # columns: DATE, RATE (decimal)
+
+# --- State codes
+STATE_ACTIVE_0 = 0
+STATE_ACTIVE_1 = 1
+STATE_ACTIVE_2 = 2
+STATE_ACTIVE_3 = 3
+STATE_CHARGEOFF = 4
+STATE_CANCEL = 5
+STATE_PIF    = 6
+STATE_CANCEL_2 = 9
+TERMINAL_STATES = {STATE_CANCEL, STATE_PIF, STATE_CANCEL_2}
+NONPAY_PREPAY_STATES = {STATE_CANCEL, STATE_PIF, STATE_CANCEL_2}
+ACTIVE_STATES = {STATE_ACTIVE_0, STATE_ACTIVE_1, STATE_ACTIVE_2, STATE_ACTIVE_3}
+
+# ---- Model constants ----
+LATE_FEE_FLAT = 35.0
+LATE_FEE_CAP = 10.0
+LATE_FEE_RATE = 0.05 # 5%
+CHARGE_OFF_MISSED_PAYMENTS = 4    # “4 missed payments = charged-off”
+ACT_365_DENOM = 365.0
+STATE_CHARGEOFF = 4 # 120+ days in arrears
+PROB_CHOICE_CONVERSION = 0.35
+CANCEL_FEE = 350.0
+COLLECTION_RATE = 0.2 # we keep 80% and they get 20%.
+BAL_EPS = 1e-6  # tolerance for treating tiny residuals as zero
+
+# --- Age buckets
+AGE_BINS   = [-np.inf, 4, 7, 13, 19, 25, 37, 49, 61, np.inf]
+AGE_LABELS = ["0-3","4-6","7-12","13-18","19-24","25-36","37-48","49-60","61+"]
+
+# --- Random seed
+np.random.seed(1234)
+
+##build_discount_curve
+# created for the monte carlo
+def build_discount_dict(session, valuation_date: date) -> dict[date, float]:
+    yc = session.table(YIELD_CURVE_TBL).to_pandas()
+    yc.columns = yc.columns.str.lower()
+    #yc.columns = [c.upper() for c in yc.columns]
+    yc["date"] = pd.to_datetime(yc["date"], errors="coerce").dt.date
+    yc = yc.dropna(subset=["date"])
+    yc = yc.sort_values("date")
+
+    # keep only dates >= valuation_date
+    yc = yc[yc["date"] >= valuation_date].copy()
+    if yc.empty:
+        return {}
+
+    # simple compounding, ACT/365, cumulative per-day DF
+    dfs = []
+    df_running = 1.0
+    last_day = valuation_date
+    for d, r in yc[["date","rate"]].itertuples(index=False):
+        # if there are gaps, roll day-by-day using that day's rate; simplest: assume rate is for that date only
+        # since table is daily, just do one step per row:
+        df_running = df_running / (1.0 + float(r)/365.0)
+        dfs.append((d, df_running))
+
+    # include valuation_date as 1.0 in case we need it
+    disc = {valuation_date: 1.0}
+    disc.update({d: v for d, v in dfs})
+    return disc
+
+##small_utility_function
+# def to_date(x):
+#     if x is None or (isinstance(x, float) and np.isnan(x)):
+#         return None
+#     if isinstance(x, date):
+#         return x
+#     return pd.to_datetime(x).date()
+
+def to_date(x):
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return None
+    if isinstance(x, date):
+        return x
+    ts = pd.to_datetime(x, errors="coerce")
+    return None if pd.isna(ts) else ts.date()
+
+def to_int(x, default=None):
+    try:
+        if x is None or (isinstance(x, float) and np.isnan(x)):
+            return default
+        return int(x)
+    except Exception:
+        return default
+
+def to_float(x, default=0.0):
+    try:
+        if x is None or (isinstance(x, float) and np.isnan(x)):
+            return default
+        return float(x)
+    except Exception:
+        return default
+
+def to_str(x, default=""):
+    if x is None:
+        return default
+    s = str(x)
+    return default if s.lower() == "nan" else s
+
+def month_start(d: date) -> date:
+    return date(d.year, d.month, 1)
+
+def month_end(d: date) -> date:
+    # last day of month: first of next month minus a day
+    if d.month == 12:
+        first_next = date(d.year + 1, 1, 1)
+    else:
+        first_next = date(d.year, d.month + 1, 1)
+    return first_next - timedelta(days=1)
+
+def add_months(d: date, n: int) -> date:
+    y = d.year + (d.month - 1 + n) // 12
+    m = (d.month - 1 + n) % 12 + 1
+    day = min(d.day, month_end(date(y, m, 1)).day)
+    return date(y, m, day)
+
+# month difference ignoring days, e.g., 2025-02-10 vs 2024-12-01 -> 2
+def months_between(d1: date, d2: date) -> int:
+    if d1 is None or d2 is None:
+        return 0
+    return (d2.year - d1.year) * 12 + (d2.month - d1.month)
+
+def next_business_day(cand: date, bdays_sorted: list[date]) -> date | None:
+    """
+    Return the first business day >= cand using bisect.
+    If cand is after the last known business day, return None (caller must handle).
+    """
+    i = bisect_left(bdays_sorted, cand)
+    if i >= len(bdays_sorted):
+        return None  # beyond known calendar; caller decides how to handle
+    return bdays_sorted[i]
+
+def last_dom(d: date) -> int:
+    return calendar.monthrange(d.year, d.month)[1]
+
+def anchor_due_date(first_payment_date: date, month_start: date, bdays_sorted: list[date]) -> date | None:
+    """
+    Use FIRST_PAYMENT_DATE's day-of-month as the anchor for this month, 
+    then roll forward to the next *business* day on/after that day.
+    """
+    dom = first_payment_date.day
+    dom_this_month = min(dom, last_dom(month_start))
+    cand = date(month_start.year, month_start.month, dom_this_month)
+    return next_business_day(cand, bdays_sorted)
+
+# Robust NA -> None + Python-primitive coercion for Snowflake
+def sanitize_for_snowflake(df,
+                           date_cols=None,
+                           int_cols=None,
+                           float_cols=None,
+                           bool_cols=None,
+                           str_cols=None):
+
+    date_cols  = [c.upper() for c in (date_cols  or [])]
+    int_cols   = [c.upper() for c in (int_cols   or [])]
+    float_cols = [c.upper() for c in (float_cols or [])]
+    bool_cols  = [c.upper() for c in (bool_cols  or [])]
+    str_cols   = [c.upper() for c in (str_cols   or [])]
+
+    # Normalize column names to UPPER so lists above match
+    df = df.copy()
+    df.columns = [c.upper() for c in df.columns]
+
+    # Dates: coerce to datetime, then convert to real Python date or None
+    for c in date_cols:
+        if c not in df.columns:
+            continue
+        s = pd.to_datetime(df[c], errors="coerce")  # datetime64[ns] with NaT for bads
+        df[c] = s.apply(lambda x: x.date() if not pd.isna(x) else None)
+
+    # Ints: use pandas nullable Int64 then map <NA> -> None so Snowflake sees NULL
+    for c in int_cols:
+        if c not in df.columns:
+            continue
+        s = pd.to_numeric(df[c], errors="coerce").astype("Int64")
+        df[c] = s.where(~s.isna(), None)
+
+    # Floats: coerce; leave NaN as None
+    for c in float_cols:
+        if c not in df.columns:
+            continue
+        s = pd.to_numeric(df[c], errors="coerce")
+        df[c] = s.where(~s.isna(), None)
+
+    # Bools: coerce; leave unknown as None
+    for c in bool_cols:
+        if c not in df.columns:
+            continue
+        s = df[c].astype("boolean")
+        df[c] = s.where(~s.isna(), None)
+
+    # Strings: ensure str, replace "nan"/NaN with None
+    for c in str_cols:
+        if c not in df.columns:
+            continue
+        s = df[c].astype("string")
+        df[c] = s.where(~s.isna(), None)
+
+    return df
+
+def months_since(orig: date, on: date) -> int:
+    # whole-month aging (no day-of-month fine tuning needed for buckets)
+    return max(0, (on.year - orig.year) * 12 + (on.month - orig.month))
+
+def age_bucket_for(m: int) -> str:
+    # uses your labels
+    if m < 4:   return "0-3"
+    if m < 7:   return "4-6"
+    if m < 13:  return "7-12"
+    if m < 19:  return "13-18"
+    if m < 25:  return "19-24"
+    if m < 37:  return "25-36"
+    if m < 49:  return "37-48"
+    if m < 61:  return "49-60"
+    return "61+"
+
+def reconcile_flags(L):
+    """Enforce flags based on current state/balances after today's cash movements."""
+    # Normalize tiny residuals
+    if abs(L.current_balance) < BAL_EPS:
+        L.current_balance = 0.0
+    if abs(L.accrued_interest) < BAL_EPS:
+        L.accrued_interest = 0.0
+    if abs(L.deferred_interest_balance) < BAL_EPS:
+        L.deferred_interest_balance = 0.0
+    if abs(L.arrears_amount) < BAL_EPS:
+        L.arrears_amount = 0.0
+
+    # 1) Cancelled when entering 5 or 9
+    if L.prev_state_eff in {STATE_CANCEL, STATE_CANCEL_2}:
+        L.cancelled = True
+
+    # 2) Charged-off flag mirrors state 4
+    if L.prev_state_eff == STATE_CHARGEOFF:
+        L.charged_off = True
+
+    # 3) Paid-in-full when principal is zero (per your rule), and lock to state 6
+    if L.current_balance == 0.0 and not L.paidoff:
+        L.paidoff = True
+        # Move to PIF state unless already in a terminal cancel state
+        if L.prev_state_eff not in TERMINAL_STATES:
+            L.prev_state_eff = STATE_PIF   
+
+def _clamp_active(s: int) -> int:
+    """Clamp to [0,3] so we can compare active buckets safely."""
+    return max(0, min(3, int(s)))
+
+def _arrears_and_fees_from_missed(missed_payments: int, expected_payment: float) -> tuple[float, float]:
+    """
+    Base (no-circular) arrears formula:
+      base_arrears = missed_payments * expected_payment
+      total_fees   = min(base_arrears * LATE_FEE_RATE, missed_payments * LATE_FEE_CAP)
+    Returns (base_arrears, total_fees)
+    """
+    base_arrears = max(0, int(missed_payments)) * max(0.0, float(expected_payment))
+    total_fees   = min(base_arrears * LATE_FEE_RATE, int(missed_payments) * LATE_FEE_CAP)
+    return base_arrears, total_fees
+
+def freeze_at_chargeoff(L, d):
+    """
+    Make charge-off state sticky and freeze accrual/arrears/fees going forward.
+    Safe to call idempotently.
+    """
+    L.prev_state_eff = STATE_CHARGEOFF
+    L.charged_off    = True
+    if getattr(L, "chargeoff_date", None) is None:
+        L.chargeoff_date = d
+    # After this day, your engine should avoid growing arrears/fees/accruals for CO loans.
+    # (You likely already do this by skipping scheduled pays and accrual growth where neeeded)
+
+##load_normalize_transitions_tbl
+def _normalize_cols_lower(df: pd.DataFrame) -> pd.DataFrame:
+    df.columns = [c.lower() for c in df.columns]
+    return df
+
+def _safe_int_series(s: pd.Series, default=-1) -> pd.Series:
+    return pd.to_numeric(s, errors="coerce").fillna(default).astype(int)
+
+def _safe_float_series(s: pd.Series, default=0.0) -> pd.Series:
+    return pd.to_numeric(s, errors="coerce").fillna(default)
+
+def _safe_str_series(s: pd.Series, default="UNKNOWN") -> pd.Series:
+    s = s.astype(str)
+    return s.replace({"nan": default}).fillna(default)
+
+def _df_for_date_factory(disc: dict[date, float], valuation_date: date):
+    keys = sorted(disc.keys())
+    def df_for_date(d: date) -> float:
+        if d in disc:
+            return float(disc[d])
+        i = bisect_right(keys, d) - 1
+        if i < 0:
+            return 1.0
+        return float(disc[keys[i]])
+    return df_for_date
+
+##format_portfolio_metrics
+# -- load transitions
+transitions_pdf = _normalize_cols_lower(session.table(T_TRANS).to_pandas())
+# handle common typo just in case
+if "channel_parter_tier" in transitions_pdf.columns and "channel_partner_tier" not in transitions_pdf.columns:
+    transitions_pdf.rename(columns={"channel_parter_tier": "channel_partner_tier"}, inplace=True)
+
+# Normalize types & case
+transitions_pdf["age_bucket"]           = _safe_str_series(transitions_pdf["age_bucket"]).str.strip().str.upper()
+transitions_pdf["product_category"]     = _safe_str_series(transitions_pdf["product_category"]).str.strip().str.upper()
+transitions_pdf["fico_band"]            = _safe_str_series(transitions_pdf["fico_band"]).str.strip().str.upper()
+transitions_pdf["promo_period"]         = _safe_int_series(transitions_pdf["promo_period"], -1)
+transitions_pdf["channel_partner_tier"] = _safe_int_series(transitions_pdf["channel_partner_tier"], -1)
+transitions_pdf["present_state"]        = _safe_int_series(transitions_pdf["present_state"], 0)
+transitions_pdf["future_state"]         = _safe_int_series(transitions_pdf["future_state"], 0)
+transitions_pdf["rates"]                = _safe_float_series(transitions_pdf["rates"], 0.0)
+
+# Canonical composite key
+transitions_pdf["__key__"] = list(zip(
+    transitions_pdf["age_bucket"],
+    transitions_pdf["product_category"],
+    transitions_pdf["promo_period"],
+    transitions_pdf["channel_partner_tier"],
+    transitions_pdf["fico_band"],
+    transitions_pdf["present_state"],
+))
+
+# Build groups: key -> df[future_state, p]
+TRANS_GROUPS = {}
+for key, g in transitions_pdf.groupby("__key__"):
+    g2 = g[["future_state", "rates"]].copy()
+    s = g2["rates"].sum()
+    g2["p"] = (g2["rates"] / s) if s > 0 else 0.0
+    TRANS_GROUPS[key] = g2
+
+# Load milestone & smm & charge-off smm data
+smm_pdf    = _normalize_cols_lower(session.table(T_SMM).to_pandas())
+smm_co_pdf = _normalize_cols_lower(session.table(T_SMM_CO).to_pandas())
+miles_pdf  = _normalize_cols_lower(session.table(T_MILES).to_pandas())
+
+# Normalize types & case
+# ---------- smm ----------
+smm_pdf["months_since_origination"] = _safe_int_series(smm_pdf["months_since_origination"], -1)
+smm_pdf["promo_period"]             = _safe_int_series(smm_pdf["promo_period"], -1)
+smm_pdf["channel_partner_tier"]     = _safe_int_series(smm_pdf["channel_partner_tier"], -1)
+smm_pdf["product_category"]         = _safe_str_series(smm_pdf["product_category"]).str.strip().str.upper()
+smm_pdf["fico_band"]                = _safe_str_series(smm_pdf["fico_band"]).str.strip().str.upper()
+smm_pdf["avg_smm"]                  = _safe_float_series(smm_pdf["avg_smm"], 0.0)
+
+# ---------- charge-off smm ----------
+smm_co_pdf["months_since_co"]       = _safe_int_series(smm_co_pdf["months_since_co"], -1)
+smm_co_pdf["channel_partner_tier"]  = _safe_int_series(smm_co_pdf["channel_partner_tier"], -1)
+smm_co_pdf["product_category"]      = _safe_str_series(smm_co_pdf["product_category"]).str.strip().str.upper()
+smm_co_pdf["fico_band"]             = _safe_str_series(smm_co_pdf["fico_band"]).str.strip().str.upper()
+smm_co_pdf["avg_smm"]               = _safe_float_series(smm_co_pdf["avg_smm"], 0.0)
+
+# ---------- milestones ----------
+miles_pdf["product_category"]           = _safe_str_series(miles_pdf["product_category"]).str.strip().str.upper()
+miles_pdf["channel_partner_tier"]       = _safe_int_series(miles_pdf["channel_partner_tier"], -1)
+miles_pdf["promo_period"]               = _safe_int_series(miles_pdf["promo_period"], -1)
+miles_pdf["to_milestone"]               = _safe_int_series(miles_pdf["to_milestone"], 0)
+miles_pdf["avg_number_of_days"]         = _safe_int_series(miles_pdf["avg_number_of_days"], 0)
+miles_pdf["disbursement_sequence_name"] = _safe_str_series(miles_pdf["disbursement_sequence_name"]).str.strip().str.upper()
+
+##business_days_loader
+def load_business_days(session: Session,
+                       start_d: date | datetime | pd.Timestamp | str,
+                       end_d:   date | datetime | pd.Timestamp | str,
+                       pad_days: int = 60) -> tuple[set[date], list[date]]:
+    """Return (set_of_business_days, sorted_list_of_business_days) within [start_d-pad, end_d+pad]."""
+
+    # normalize to Python date
+    def _to_date(x):
+        if x is None:
+            return None
+        if isinstance(x, date) and not isinstance(x, datetime):
+            return x
+        if isinstance(x, datetime):
+            return x.date()
+        if isinstance(x, pd.Timestamp):
+            return x.date()
+        # strings / other -> parse
+        return pd.to_datetime(x, errors="coerce").date()
+
+    start_d = _to_date(start_d)
+    end_d   = _to_date(end_d)
+    if start_d is None or end_d is None:
+        raise ValueError("load_business_days requires non-null start_d and end_d")
+
+    # use datetime.timedelta with date objects
+    start_q = start_d - timedelta(days=pad_days)
+    end_q   = end_d   + timedelta(days=pad_days)
+
+    # pull business days (weekday AND not holiday)
+    pdf = session.sql(f"""
+        SELECT FULL_DATE
+        FROM LEGACYDB.DATA_WAREHOUSE.DIM_DATE
+        WHERE DAY_IS_WEEKDAY = TRUE
+          AND DAY_IS_HOLIDAY = FALSE
+          AND FULL_DATE BETWEEN '{start_q}' AND '{end_q}'
+        ORDER BY FULL_DATE
+    """).to_pandas()
+
+    # coerce safely to date and drop invalids
+    dates = (pd.to_datetime(pdf["FULL_DATE"], errors="coerce")
+               .dropna()
+               .dt.date
+               .tolist())
+
+    bdays_sorted = dates
+    bdays_set    = set(dates)
+    return bdays_set, bdays_sorted
+
+## age_bucket_sampler
+## --- This is the most important part of the program ---------------- ##
+## -------------------------------------------------------------------##
+
+def age_bucket_on_date(origination_date: date, on_date: date) -> str:
+    aged_months = (on_date.year - origination_date.year) * 12 + (on_date.month - origination_date.month)
+    aged_months = max(0, aged_months)
+    return pd.cut([aged_months], bins=AGE_BINS, labels=AGE_LABELS, right=False)[0]
+
+def sample_next_state_by_key(product: str, promo: int, tier: int, fico: str,
+                             prev_state: int, age_bucket: str) -> int:
+    key = (str(age_bucket).strip().upper(),
+           str(product).strip().upper(),
+           int(promo), int(tier),
+           str(fico).strip().upper(),
+           int(prev_state))
+    g = TRANS_GROUPS.get(key)
+    if g is None or g.empty:
+        return int(prev_state)
+    probs = g["p"].to_numpy()
+    probs = np.clip(probs, 0.0, 1.0)
+    s = probs.sum()
+    if s <= 0:
+        return int(prev_state)
+    futures = g["future_state"].to_numpy(dtype=int)
+    return int(np.random.choice(futures, p=probs / s))
+
+def sample_next_state_dynamic(L, prev_state: int, decision_date):
+    # Guard against None decision_date
+    if decision_date is None or L.origination_date is None:
+        key_dbg = ("<NO_DATE>", L.product, L.promo, L.tier, L.fico_band, prev_state)
+        return prev_state, (None, None, str(key_dbg), False, 0.0)
+
+    # Compute bucket on the decision (promotion) date
+    aged = months_since(L.origination_date, decision_date)
+    age_bucket = age_bucket_for(aged)
+
+    key = (age_bucket, L.product, L.promo, L.tier, L.fico_band, prev_state)
+    g = TRANS_GROUPS.get(key)
+
+    # No matching row: hold state
+    if g is None or len(g) == 0:
+        return prev_state, (aged, age_bucket, str(key), False, 0.0)
+
+    # Prefer numeric 'rates'; if absent, try 'p'
+    rates_sum = 0.0
+    probs = None
+
+    if "rates" in g:
+        r = pd.to_numeric(g["rates"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+        rates_sum = float(np.nansum(r))
+        if rates_sum > 0.0:
+            probs = r / rates_sum
+        else:
+            # all zero/NaN rates -> fallback later
+            probs = None
+
+    if probs is None and "p" in g:
+        p = pd.to_numeric(g["p"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+        # use sum of p as a diagnostic “rates_sum” if no rates column
+        rates_sum = float(np.nansum(p))
+        probs = p
+
+    # If still nothing usable, hold state
+    if probs is None:
+        return prev_state, (aged, age_bucket, str(key), True, rates_sum)
+
+    # Sanitize probs: replace NaN/inf, clip, renormalize
+    probs = np.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
+    probs = np.clip(probs, 0.0, 1.0)
+    s = probs.sum()
+    if s <= 0.0:
+        return prev_state, (aged, age_bucket, str(key), True, rates_sum)
+    probs = probs / s
+
+    futures = g["future_state"].to_numpy(dtype=int)
+
+    # Align lengths defensively
+    n = min(len(futures), len(probs))
+    if n == 0:
+        return prev_state, (aged, age_bucket, str(key), True, rates_sum)
+
+    futures = futures[:n]
+    probs   = probs[:n]
+
+    # Final guard against any residual numeric weirdness
+    if not np.isfinite(probs).all() or np.any(np.isnan(probs)) or probs.sum() <= 0:
+        return prev_state, (aged, age_bucket, str(key), True, rates_sum)
+
+    try:
+        nxt = int(np.random.choice(futures, p=probs))
+    except ValueError:
+        # e.g., if numpy still rejects p for any reason
+        return prev_state, (aged, age_bucket, str(key), True, rates_sum)
+
+    return nxt#, (aged, age_bucket, str(key), True, rates_sum)
+
+##loan class
+class LoanBase:
+    def __init__(self, row: dict, business_days: set[date]):
+        # case-insensitive getter
+        g = lambda k: row.get(k.upper()) if k.upper() in row else row.get(k.lower())
+
+        self.loan_id           = to_int(g("loan_id"))
+        self.product           = to_str(g("product_category")).strip().upper()
+        self.tier              = to_int(g("account_tier"), -1)
+        self.fico_band         = to_str(g("fico_band")).strip().upper()
+        self.promo             = to_int(g("promo_period"), -1)
+
+        # dates
+        self.origination_date   = to_date(g("origination_date"))
+        self.first_payment_date = to_date(g("first_payment_date"))
+        self.maturity_date      = to_date(g("maturity_date")) or date(2099, 12, 31)
+        self.effective_date     = to_date(g("effective_date"))
+        self.oppty_date         = to_date(g("opportunity_created_date"))
+        self.chargeoff_date     = to_date(g("chargeoff_date"))  # keep value from source if present
+        self.promo_end_date     = to_date(g("promo_end_date"))
+
+        # interest
+        self.annual_rate        = to_float(g("interest_rate"), 0.0)
+
+        # state
+        self.prev_state_eff      = to_int(g("current_state"), 0)   # in effect between dues
+        self.next_state_pending  = None
+        self.state               = self.prev_state_eff            # legacy compat for callers that read .state
+
+        # pools
+        self.prev_me_balance     = to_float(g("previous_month_balance"), 0.0)
+
+        # business calendar — keep both set & sorted list (bisect helpers need sorted list)
+        self.business_days_set     = set(business_days or [])
+        self.business_days_sorted  = sorted(self.business_days_set)
+        # Back-compat with your existing code that passes self.business_days
+        self.business_days         = self.business_days_sorted
+
+        # Other fields used elsewhere
+        self.dev                       = to_str(g("developer"))
+        self.proj                      = to_str(g("project"))
+        self.disb_seq                  = to_str(g("disbursement_sequence_name"), default=None)
+        self.current_balance           = to_float(g("current_balance"), 0.0)
+        self.accrued_interest          = to_float(g("interest_receivable"), 0.0)
+        self.deferred_interest_balance = to_float(g("deferred_interest_balance"), 0.0)
+        self.arrears_amount            = to_float(g("arrears_amount"), 0.0)
+        self.total_fees                = to_float(g("total_fees"), 0.0)
+        self.missed_payments           = to_int(g("number_of_payments_arrears"), 0)
+        self.charged_off               = False
+        self.cancelled                 = False
+        self.paidoff                   = False
+        self.cancellation_fee          = 0.0
+        self.cumulative_collection_agency_remittance = 0.0
+        self.principal_advanced_amount = to_float(g("principal_advanced_amount"), 0.0)
+
+        # payments
+        self.monthly_payment           = to_float(g("current_monthly_payment"), 0.0)
+        self.standard_monthly_payment  = to_float(g("standard_monthly_payment"), self.monthly_payment)
+
+        # Choice fields (available for all; used by Type3)
+        self.choice_target_amount = to_float(g("choice_target_amount"), 0.0)
+        self.choice_target_date   = to_date(g("choice_target_date"))
+        self.choice_decision_date = None
+        self.choice_decided       = False
+        self.choice_skip          = False
+        self.choice_last_flag     = 0
+        self.choice_last_amt      = 0.0
+
+        # counters
+        self.months_since_orig = to_int(g("months_since_origination"), 0)
+        self.months_since_co   = to_int(g("months_since_co"), None)
+
+        # milestones / unfunded
+        self.cum_unfunded_amt = to_float(g("cum_unfunded_amt"), 0.0)
+        self.m_disb = {
+            0: to_float(g("m0_remaining_disb_amt"), 0.0),
+            1: to_float(g("m1_remaining_disb_amt"), 0.0),
+            2: to_float(g("m2_remaining_disb_amt"), 0.0),
+            3: to_float(g("m3_remaining_disb_amt"), 0.0),
+        }
+
+        # grace windows
+        iptd = to_date(g("interest_paid_to_date"))
+        eff  = self.effective_date
+        if iptd and eff and iptd < eff:
+            paid_to_start = iptd - pd.to_timedelta(1, unit="d")
+        else:
+            paid_to_start = eff
+
+        susp_start = to_date(g("interest_suspension_start_date"))
+        susp_end   = to_date(g("interest_suspension_end_date"))
+
+        self.grace_windows = []
+        if susp_start and susp_end:
+            self.grace_windows.append((susp_start, susp_end))
+        if iptd and paid_to_start:
+            self.grace_windows.append((paid_to_start, iptd))
+
+        self._hit_pif_once = False
+
+        # present value fields
+        self._pv_initial_done = False
+        self.pv_initial_advance_applied = 0.0
+        self.pv_payment_applied = 0.0
+        self.pv_prepay_applied = 0.0
+        self.pv_advance_applied = 0.0
+        self.pv_cumulative_collection_agency_remittance = 0.0
+        
+    @property
+    def daily_rate(self) -> float:
+        # ACT/365
+        return (self.annual_rate or 0.0) / 365.0
+
+    def accrue_daily(self, d: date):
+        if self.charged_off:
+            return
+        # default: respect grace windows (your Type1/Type2 override as needed)
+        if not self.is_grace_period(d):
+            self.accrued_interest += self.daily_rate * max(self.current_balance, 0.0)
+
+    # milestone calendar: add avg days per milestone & roll to business day
+    def milestone_dates(self, miles_df: pd.DataFrame) -> dict[int, date]:
+        if self.cum_unfunded_amt <= 0 or self.disb_seq is None:
+            return {}
+        sub = miles_df[
+            (miles_df["product_category"] == self.product) &
+            (miles_df["promo_period"] == self.promo) &
+            (miles_df["channel_partner_tier"] == self.tier) &
+            (miles_df["disbursement_sequence_name"] == self.disb_seq)
+        ]
+        out = {}
+        for m in (0, 1, 2, 3):
+            amt = self.m_disb.get(m, 0.0)
+            if amt > 0:
+                row = sub[sub["to_milestone"] == m]
+                if not row.empty:
+                    ndays = int(row.iloc[0]["avg_number_of_days"])
+                    d0 = self.oppty_date + pd.to_timedelta(ndays, unit="D")
+                    out[m] = next_business_day(d0, self.business_days_sorted)
+        return out
+
+    def months_since_orig_on(self, ref_date: date) -> int:
+        return max(0, months_between(self.origination_date, ref_date))
+
+    def months_since_co_on(self, ref_date: date) -> int | None:
+        if not self.chargeoff_date:
+            return None
+        return max(0, months_between(self.chargeoff_date, ref_date))
+
+    def is_grace_period(self, d: date) -> bool:
+        for s, e in self.grace_windows:
+            if s <= d <= e:
+                return True
+        return False
+
+    def apply_payment_priority(self, amount: float) -> float:
+        """Apply cash by priority: deferred interest -> arrears -> accrued interest -> principal."""
+        remaining = float(amount or 0.0)
+        applied_total = 0.0
+
+        # 1) Deferred interest
+        if remaining > 0 and self.deferred_interest_balance > 0:
+            sweep = min(remaining, self.deferred_interest_balance)
+            self.deferred_interest_balance -= sweep
+            remaining -= sweep
+            applied_total += sweep
+
+        # 2) Arrears
+        if remaining > 0 and self.arrears_amount > 0:
+            sweep = min(remaining, self.arrears_amount)
+            self.arrears_amount -= sweep
+            remaining -= sweep
+            applied_total += sweep
+
+        # 3) Accrued interest
+        if remaining > 0 and self.accrued_interest > 0:
+            sweep = min(remaining, self.accrued_interest)
+            self.accrued_interest -= sweep
+            remaining -= sweep
+            applied_total += sweep
+
+        # 4) Principal
+        if remaining > 0 and self.current_balance > 0:
+            sweep = min(remaining, self.current_balance)
+            self.current_balance -= sweep
+            remaining -= sweep
+            applied_total += sweep
+
+        return applied_total
+
+    def record(self, d,
+               expected_payment,
+               payment_applied,
+               prev_state,
+               next_state,
+               prepay_applied=0.0,
+               advance_applied=0.0,
+               choice_flag=0,
+               choice_prepay_amt=0.0,
+               pv_initial_advance_applied = 0.0,
+               pv_payment_applied = 0.0,
+               pv_prepay_applied = 0.0,
+               pv_advance_applied = 0.0,
+               pv_cumulative_collection_agency_remittance = 0.0,
+               **kwargs):
+        """
+        Returns only Python-native types; includes optional transition debug fields if provided:
+          aged_months, age_bucket, key_used, key_hit, rates_sum, run_id
+        """
+        # optional diagnostics w/ safe defaults
+        aged_months = int(kwargs.get("aged_months")) if kwargs.get("aged_months") is not None else None
+        age_bucket  = kwargs.get("age_bucket")
+        key_used    = kwargs.get("key_used")
+        key_hit     = bool(kwargs.get("key_hit")) if kwargs.get("key_hit") is not None else None
+        rates_sum   = float(kwargs.get("rates_sum")) if kwargs.get("rates_sum") is not None else None
+        run_id      = kwargs.get("run_id")
+
+        return {
+            "loan_id": self.loan_id,
+            "date": d,  # datetime.date
+            "current_balance": float(self.current_balance),
+            "accrued_interest": float(self.accrued_interest),
+            "deferred_interest_balance": float(self.deferred_interest_balance),
+            "arrears_amount": float(self.arrears_amount),
+            "total_fees": float(self.total_fees),
+            "missed_payments": int(self.missed_payments),
+            "charged_off": bool(self.charged_off),
+            "cancelled": bool(self.cancelled),
+            "paid_in_full": bool(self.paidoff),
+            "cancellation_fee": float(self.cancellation_fee),
+            "expected_payment": float(expected_payment or 0.0),
+            "payment_applied": float(payment_applied or 0.0),
+            "prepay_applied": float(prepay_applied or 0.0),
+            "advance_applied": float(advance_applied or 0.0),
+            "choice_flag": int(choice_flag),
+            "choice_prepay_amt": float(choice_prepay_amt or 0.0),
+            "prev_state": int(prev_state) if prev_state is not None else None,
+            "next_state": int(next_state) if next_state is not None else None,
+            "cumulative_collection_agency_remittance": float(getattr(self, "cumulative_collection_agency_remittance", 0.0)),
+            # present value fields
+            "pv_initial_advance_applied": float(pv_initial_advance_applied or 0.0),
+            "pv_payment_applied": float(pv_payment_applied or 0.0),
+            "pv_prepay_applied": float(pv_prepay_applied or 0.0),
+            "pv_advance_applied": float(pv_advance_applied or 0.0),
+            "pv_cumulative_collection_agency_remittance": float(pv_cumulative_collection_agency_remittance or 0.0),
+            # optional transition debug fields:
+            "aged_months": aged_months,
+            "age_bucket": age_bucket,
+            "key_used": key_used,
+            "key_hit": key_hit,
+            "rates_sum": rates_sum,
+            "run_id": run_id,
+        }
+
+
+class Type1Loan(LoanBase):
+    def accrue_daily(self, d: date):
+        if self.charged_off:
+            return
+        # promo deferral -> deferred interest; post-promo normal if not grace
+        if self.promo_end_date:
+            deferred_start = self.effective_date
+            if deferred_start and (deferred_start <= d < self.promo_end_date):
+                self.deferred_interest_balance += self.daily_rate * max(self.current_balance, 0.0)
+                return
+            if d >= self.promo_end_date and not self.is_grace_period(d):
+                self.accrued_interest += self.daily_rate * max(self.current_balance, 0.0)
+                return
+        # default
+        super().accrue_daily(d)
+
+
+class Type2Loan(LoanBase):
+    def __init__(self, row, business_days):
+        super().__init__(row, business_days)
+        self._deferred_capitalized = False
+
+    def accrue_daily(self, d: date):
+        #freeze the accurals when there's a c/o
+        if self.charged_off:
+            return
+            
+        if self.promo_end_date:
+            deferred_start = self.effective_date
+            if deferred_start and (deferred_start <= d < self.promo_end_date):
+                self.deferred_interest_balance += self.daily_rate * max(self.current_balance, 0.0)
+                return
+            if d == self.promo_end_date and not self._deferred_capitalized:
+                if self.current_balance > 0:
+                    self.current_balance += self.deferred_interest_balance
+                self.deferred_interest_balance = 0.0
+                self._deferred_capitalized = True
+            if d > self.promo_end_date and not self.is_grace_period(d):
+                self.accrued_interest += self.daily_rate * max(self.current_balance, 0.0)
+                return
+        super().accrue_daily(d)
+
+
+class Type3Loan(LoanBase):
+    def __init__(self, row, business_days):
+        super().__init__(row, business_days)
+        g = lambda k: row.get(k.upper()) if k.upper() in row else row.get(k.lower())
+
+        # inputs present in LOAN_DATA
+        self.choice_target_amount = to_float(g("choice_target_amount"), 0.0)
+        self.choice_target_date   = to_date(g("choice_target_date"))
+        self.standard_monthly_payment = to_float(g("standard_monthly_payment"), self.monthly_payment)
+
+        # state / flags
+        self.choice_decided = False
+        self.choice_flag_value = 0
+        self.choice_payment_date = None  # set below
+
+        # Compute now using whatever calendar we have; it will be recomputed later by the loader
+        self._compute_choice_payment_date()  # wrapper -> compute_choice_payment_date()
+
+    # ---- NEW: public method that can be called with or without bdays_sorted
+    def compute_choice_payment_date(self, bdays_sorted=None):
+        """
+        Set and return the first scheduled due date on/after CHOICE_TARGET_DATE (business-adjusted),
+        or None if not determinable.
+        """
+        if not self.choice_target_date or not self.first_payment_date:
+            self.choice_payment_date = None
+            return None
+
+        # Prefer an explicitly provided sorted calendar; otherwise use what we have
+        if bdays_sorted is None:
+            bdays_sorted = getattr(self, "business_days_sorted", None)
+        if bdays_sorted is None:
+            # Fall back to sorting the set if that's all we have during __init__
+            bset = getattr(self, "business_days", None)
+            if isinstance(bset, set):
+                bdays_sorted = sorted(bset)
+
+        # If still missing a calendar, bail gracefully
+        if not bdays_sorted:
+            self.choice_payment_date = None
+            return None
+
+        m = month_start(self.choice_target_date)
+        # Search forward (ample horizon; adjust if you like)
+        for _ in range(60):
+            due = anchor_due_date(self.first_payment_date, m, bdays_sorted)
+            if due is not None and due >= self.choice_target_date:
+                self.choice_payment_date = due
+                return due
+            m = add_months(m, 1)
+
+        self.choice_payment_date = None
+        return None
+
+    # ---- NEW: backward-compatible wrapper
+    def _compute_choice_payment_date(self):
+        return self.compute_choice_payment_date()
+
+    def is_choice_decision_day(self, d: date) -> bool:
+        return (self.choice_payment_date is not None) and (not self.choice_decided) and (d == self.choice_payment_date)
+
+    def is_prepayment_eligible(self) -> bool:
+        # Eligible states: 0–3; not 4/5/6/9
+        return self.prev_state_eff in ACTIVE_STATES
+
+
+class Type4Loan(LoanBase):
+    """Base behavior (no special promo rules)."""
+    pass
+
+
+def create_loan_instance(row: dict, business_days: set[date]) -> LoanBase:
+    g = lambda k: row.get(k.upper()) if k.upper() in row else row.get(k.lower())
+    developer = to_str(g("developer"))
+    project   = to_str(g("project"))
+    if developer == '1500' and project in ['1500', '1501']:
+        return Type1Loan(row, business_days)
+    elif developer == '1500' and project in ['1504', '1516', '1517']:
+        return Type2Loan(row, business_days)
+    elif developer == '1510' and project in ['1513', '1514', '1515', '1615', '1619']:
+        return Type3Loan(row, business_days)
+    else:
+        return Type4Loan(row, business_days)
+
+## monthly_principal_balance_pools
+def smm_for_loan_month(loan: LoanBase, on_date: date, for_state4: bool) -> float:
+    if for_state4:
+        mco = loan.months_since_co_on(on_date)
+        if mco is None:
+            return 0.0
+        sub = smm_co_pdf[
+            (smm_co_pdf.months_since_co == int(mco)) &
+            (smm_co_pdf.product_category == loan.product) &
+            (smm_co_pdf.channel_partner_tier == loan.tier) &
+            (smm_co_pdf.fico_band == loan.fico_band)
+        ]
+    else:
+        morig = loan.months_since_orig_on(on_date)
+        sub = smm_pdf[
+            (smm_pdf.months_since_origination == int(morig)) &
+            (smm_pdf.promo_period == loan.promo) &
+            (smm_pdf.product_category == loan.product) &
+            (smm_pdf.channel_partner_tier == loan.tier) &
+            (smm_pdf.fico_band == loan.fico_band)
+        ]
+    return float(sub["avg_smm"].iloc[0]) if not sub.empty else 0.0
+
+def compute_monthly_pools(loans: list[LoanBase],
+                          prev_me_map: dict[int, float],
+                          month_due_date: dict[int, date]) -> tuple[float, dict[int,float]]:
+    """
+    Returns:
+      general_pool_amount (for states 0–3) and
+      state4_recoveries: {loan_id -> recovery amount}
+
+    Pool math:
+      - General pool = SUM (SMM_i * priorME_i) across loans in states 0–3
+      - State 4 recoveries are per-loan: SMM_CO_i * priorME_i
+    All SMMs use the loan’s *due date* for the month as the reference date.
+    """
+    general = 0.0
+    state4_map: dict[int, float] = {}
+
+    for L in loans:
+        prev_me = float(prev_me_map.get(L.loan_id, 0.0) or 0.0)
+        if prev_me <= 0.0:
+            continue  # nothing to contribute
+
+        # Exclude terminals 5,6,9 from both pools
+        if L.prev_state_eff in TERMINAL_STATES:
+            continue
+
+        due = month_due_date.get(L.loan_id, L.first_payment_date)
+
+        if L.prev_state_eff == STATE_CHARGEOFF:  # 4
+            smm = smm_for_loan_month(L, on_date=due, for_state4=True)
+            smm = max(0.0, min(1.0, float(smm)))
+            amt = smm * prev_me
+            if amt > 0:
+                state4_map[L.loan_id] = amt
+        else:
+            # states 0–3 go to the general pool
+            smm = smm_for_loan_month(L, on_date=due, for_state4=False)
+            smm = max(0.0, min(1.0, float(smm)))
+            general += smm * prev_me
+
+    return general, state4_map
+
+##cash flow engine
+def run_one_month(loans: list[LoanBase],
+                  asof_month_start: date,
+                  bdays_sorted: list[date],
+                  prev_me_map: dict[int, float],
+                  miles_df: pd.DataFrame,
+                  df_for_date=None,                 # <-- NEW
+                  first_sim_day: date | None = None   # <-- NEW
+                 ):
+    """
+    One row per loan per day.
+    - Between due dates: prev_state = last promoted; next_state = most recently sampled.
+    - On due date: promote pending -> effective; apply cashflows; resample pending using NEXT month's due date.
+    """
+    daily_rows = []
+
+    # Helper: tolerate samplers that return int OR (int, debug_tuple)
+    def _sample_with_dbg(L, prev_state: int, decision_date: date):
+        res = sample_next_state_dynamic(L, prev_state, decision_date)
+        if isinstance(res, tuple) and len(res) == 2:
+            nxt, dbg = res
+        else:
+            nxt, dbg = res, (None, None, None, None, None)  # aged, bucket, key, hit, rates_sum
+        return int(nxt), dbg
+
+    # Due date for THIS month
+    month_due_date = {
+        L.loan_id: anchor_due_date(L.first_payment_date, asof_month_start, bdays_sorted)
+        for L in loans
+    }
+
+    # Milestone funding dates
+    miles_when = {L.loan_id: L.milestone_dates(miles_df) for L in loans}
+
+    # Monthly pools (SMM) using prior month-end balances
+    general_pool, state4_recoveries = compute_monthly_pools(loans, prev_me_map, month_due_date)
+
+    # Pro-rata weights for general pool (eligible = active states 0–3 only)
+    weights = {
+        L.loan_id: float(prev_me_map.get(L.loan_id, 0.0) or 0.0)
+        for L in loans
+        if L.prev_state_eff in ACTIVE_STATES
+    }
+    weight_remaining = sum(weights.values())
+
+    d    = asof_month_start
+    mend = month_end(asof_month_start)
+
+    while d <= mend:
+        seen_today = set()
+        for L in loans:
+            if L.loan_id in seen_today:
+                continue
+            
+            # stop conditions
+            if d > L.maturity_date or L.paidoff or L.cancelled or (L.charged_off and L.prev_state_eff in TERMINAL_STATES):
+                continue
+            if d < L.effective_date:
+                continue
+
+            # Per-day scratch
+            expected_payment = 0.0
+            pay_applied = 0.0
+            prepay_applied = 0.0
+            adv_applied = 0.0
+            choice_flag_today = 0
+            choice_prepay_amt_today = 0.0
+            # # present value
+            # pv_initial_advance_applied = 0.0
+            # pv_payment_applied = 0.0
+            # pv_prepay_applied = 0.0
+            # pv_advance_applied = 0.0
+            # pv_cumulative_collection_agency_remittance = 0.0
+            # other itesm
+            used_pool_share = False
+
+            # Seed pending on first touch this month (non-terminals)
+            seed_dbg = (None, None, None, None, None)
+            if (L.next_state_pending is None) and (L.prev_state_eff not in TERMINAL_STATES):
+                due = month_due_date[L.loan_id]
+                if due is not None:
+                    nxt, seed_dbg = _sample_with_dbg(L, L.prev_state_eff, due)
+                    L.next_state_pending = nxt
+
+            # Display values for the row (may be updated on due date below)
+            prev_state_today = L.prev_state_eff
+            next_state_today = L.next_state_pending
+
+            # Milestones (advances) on their business day
+            mdict = miles_when.get(L.loan_id, {})
+            for m, md in mdict.items():
+                if md == d and L.m_disb.get(m, 0.0) > 0:
+                    L.current_balance += L.m_disb[m]
+                    adv_applied += L.m_disb[m]
+                    L.m_disb[m] = 0.0
+
+
+            # Daily accrual
+            # Skip if already CO, or if we will promote to CO today (prevent accrual on CO day)
+            due_today = month_due_date[L.loan_id]
+            will_charge_off_today = (
+                (due_today is not None) and (d == due_today) and (L.next_state_pending == STATE_CHARGEOFF)
+            )
+            if not (L.charged_off or will_charge_off_today):
+                L.accrue_daily(d)
+
+            # ---- Due date: promote -> cashflows -> resample for NEXT cycle
+            due_today = month_due_date[L.loan_id]
+            if (due_today is not None) and (d == due_today) and (d >= L.first_payment_date):
+
+                # 1) Promote pending -> effective
+                if L.next_state_pending is not None:
+                    L.prev_state_eff = L.next_state_pending
+                    # mark first time we hit charge-off
+                    if L.prev_state_eff == STATE_CHARGEOFF and getattr(L, "chargeoff_date", None) is None:
+                        L.chargeoff_date = d
+
+                # capture D-1 state pair for missed-payment logic
+                prev_dm1 = prev_state_today          # this is L.prev_state_eff before promotion
+                ns_dm1   = L.next_state_pending 
+
+                # Update states for output after promotion
+                prev_state_today = int(L.prev_state_eff)
+                next_state_today = L.next_state_pending  # will be replaced after resample below
+
+                # 2) Determine scheduled payment (Type3 choice rule)
+                expected_payment = L.monthly_payment
+                if isinstance(L, Type3Loan) and L.is_choice_decision_day(d):
+                    if L.current_balance <= L.choice_target_amount:
+                        expected_payment = L.monthly_payment
+                    else:
+                        expected_payment = L.standard_monthly_payment
+                        L.monthly_payment = L.standard_monthly_payment  # permanent
+
+                # 3) Cashflows under EFFECTIVE state
+                if L.prev_state_eff in {STATE_CANCEL, STATE_CANCEL_2}:
+                    # Cancelled
+                    L.accrued_interest = 0.0
+                    L.arrears_amount = 0.0
+                    L.deferred_interest_balance = 0.0
+                    L.cancellation_fee = CANCEL_FEE
+                    L.cancelled = True
+                    # terminal: no next cycle
+                    L.next_state_pending = None
+                    next_state_today = None
+
+                elif L.prev_state_eff == STATE_PIF and not L._hit_pif_once:
+                    # First promotion to PIF => payoff
+                    payoff_amt = (
+                        max(0.0, L.deferred_interest_balance)
+                        + max(0.0, L.arrears_amount)
+                        + max(0.0, L.accrued_interest)
+                        + max(0.0, L.current_balance)
+                    )
+                    prepay_applied = L.apply_payment_priority(payoff_amt)
+                    L._hit_pif_once = True
+                    L.paidoff = True
+                    L.next_state_pending = None
+                    next_state_today = None
+
+                else:
+                    # Scheduled payment (states 0–3); state 4 has no scheduled pay
+                    # -------------------------
+                    # Scheduled vs missed logic
+                    # -------------------------
+                    # Use the D-1 pair to determine cure / miss / same.
+                    prev = prev_dm1
+                    ns   = ns_dm1
+                    
+                    # Fallback if sampler didn't seed pending for some reason:
+                    if ns is None and prev in ACTIVE_STATES:
+                        ns = prev
+                    
+                    # default: no scheduled pay until decided below
+                    pay_applied = 0.0
+                    
+                    if (prev in ACTIVE_STATES) and (ns in ACTIVE_STATES):
+                        prev_a = _clamp_active(prev)
+                        ns_a   = _clamp_active(ns)
+                        delta  = ns_a - prev_a
+                    
+                        if delta > 0:
+                            # --- INCREASE (worse delinquency): no scheduled payment today
+                            L.missed_payments = min(ns_a, CHARGE_OFF_MISSED_PAYMENTS)
+                            base_arrears, fees = _arrears_and_fees_from_missed(L.missed_payments, expected_payment)
+                            L.total_fees     = fees
+                            L.arrears_amount = base_arrears + fees
+                    
+                        elif delta < 0:
+                            # --- DECREASE / cure: apply "cure" + today's scheduled
+                            cure = -delta
+                            if cure > 0:
+                                pay_applied += L.apply_payment_priority(cure * expected_payment)
+                            pay_applied += L.apply_payment_priority(expected_payment)
+                    
+                            L.missed_payments = max(ns_a, 0)
+                            base_arrears, fees = _arrears_and_fees_from_missed(L.missed_payments, expected_payment)
+                            L.total_fees     = fees
+                            L.arrears_amount = base_arrears + fees
+                    
+                        else:
+                            # --- SAME bucket: apply exactly one scheduled payment
+                            pay_applied += L.apply_payment_priority(expected_payment)
+                            L.missed_payments = ns_a
+                            base_arrears, fees = _arrears_and_fees_from_missed(L.missed_payments, expected_payment)
+                            L.total_fees     = fees
+                            L.arrears_amount = base_arrears + fees
+                    
+                    elif ns == STATE_CHARGEOFF:
+                        # Transitioning into CO this cycle — cap and freeze
+                        L.missed_payments = CHARGE_OFF_MISSED_PAYMENTS
+                        base_arrears, fees = _arrears_and_fees_from_missed(L.missed_payments, expected_payment)
+                        L.total_fees     = fees
+                        L.arrears_amount = base_arrears + fees
+                        freeze_at_chargeoff(L, d)
+                    
+                    elif ns in TERMINAL_STATES:
+                        # PIF / Cancel handled elsewhere
+                        pass
+
+                    # Prepayments / Recoveries
+                    if L.prev_state_eff == STATE_CHARGEOFF:
+                        # state-4 recoveries pool
+                        L.charged_off = True
+                        rec = float(state4_recoveries.get(L.loan_id, 0.0) or 0.0)
+                        if rec > 0:
+                            applied = L.apply_payment_priority(rec)
+                            prepay_applied += applied
+                            L.cumulative_collection_agency_remittance = applied * COLLECTION_RATE
+                            state4_recoveries[L.loan_id] = 0.0
+                    else:
+                        # Type3 choice prepay (consumes pool share) on decision due date
+                        if isinstance(L, Type3Loan) and L.is_choice_decision_day(d) and L.is_prepayment_eligible():
+                            if np.random.rand() < PROB_CHOICE_CONVERSION:
+                                choice_flag_today = 1
+                                L.choice_flag_value = 1
+                                desired = (
+                                    max(0.0, L.deferred_interest_balance)
+                                    + max(0.0, L.arrears_amount)
+                                    + max(0.0, L.accrued_interest)
+                                    + max(0.0, L.current_balance - L.choice_target_amount)
+                                )
+                                share = 0.0
+                                if general_pool > 0 and L.loan_id in weights and weight_remaining > 0:
+                                    share = general_pool * (weights[L.loan_id] / weight_remaining)
+                                apply_amt = min(desired, share)
+                                if apply_amt > 0:
+                                    applied = L.apply_payment_priority(apply_amt)
+                                    prepay_applied += applied
+                                    choice_prepay_amt_today += applied
+                                    general_pool -= applied
+                                if L.loan_id in weights:
+                                    weight_remaining -= weights[L.loan_id]
+                                    weights[L.loan_id] = 0.0
+                                used_pool_share = True
+                            L.choice_decided = True
+
+                        # Normal pool prepay if not consumed by choice (states 0–3)
+                        if (not used_pool_share) and general_pool > 0 and L.loan_id in weights and weight_remaining > 0 and L.prev_state_eff in ACTIVE_STATES:
+                            share = general_pool * (weights[L.loan_id] / weight_remaining)
+                            if share > 0:
+                                applied = L.apply_payment_priority(share)
+                                prepay_applied += applied
+                                general_pool -= applied
+                            weight_remaining -= weights[L.loan_id]
+                            weights[L.loan_id] = 0.0
+                            used_pool_share = True
+
+                    # 4) RESAMPLE pending for the NEXT cycle (only if not terminal today)
+                    if L.prev_state_eff in TERMINAL_STATES:
+                        L.next_state_pending = None
+                        next_state_today = None
+                    else:
+                        next_month = month_start(add_months(d, 1))
+                        next_due   = anchor_due_date(L.first_payment_date, next_month, bdays_sorted)
+                        if next_due is not None:
+                            nxt, res_dbg = _sample_with_dbg(L, L.prev_state_eff, next_due)
+                            L.next_state_pending = nxt
+                            next_state_today = nxt
+                            seed_dbg = res_dbg  # overwrite debug with the latest sample
+                        else:
+                            L.next_state_pending = None
+                            next_state_today = None
+
+            # End-of-day flags
+            reconcile_flags(L)
+
+            pv_payment_applied = 0.0
+            pv_prepay_applied = 0.0
+            pv_advance_applied = 0.0
+            pv_cumulative_collection_agency_remittance = 0.0
+
+            if df_for_date is not None:
+                df = float(df_for_date(d))
+                # Day-by-day PVs per your spec
+                pv_payment_applied = (pay_applied or 0.0) * df
+                pv_prepay_applied  = (prepay_applied or 0.0) * df
+                pv_advance_applied = ((adv_applied or 0.0) * -1.0) * df
+                pv_cumulative_collection_agency_remittance = ((getattr(L, "cumulative_collection_agency_remittance", 0.0) or 0.0) * -1.0) * df
+    
+                # PV of initial advance only on the very first simulated day
+                # (You described “first day of the simulation”—we key that to first_sim_day)
+            pv_initial_advance_applied = 0.0
+
+            if df_for_date is not None:
+                df = float(df_for_date(d))
+            
+                # first simulated day for this specific loan
+                first_day_for_L = max(first_sim_day or asof_month_start, L.effective_date)
+            
+                if (not L._pv_initial_done) and (d == first_day_for_L):
+                    pv_initial_advance_applied = ((getattr(L, "principal_advanced_amount", 0.0) or 0.0) * -1.0) * df
+                    L._pv_initial_done = True
+
+            # Emit one row
+            aged, bucket, key_used, key_hit, rates_sum = seed_dbg
+            daily_rows.append(
+                L.record(
+                    d,
+                    expected_payment,
+                    pay_applied,
+                    prepay_applied=prepay_applied,
+                    advance_applied=adv_applied,
+                    choice_flag=choice_flag_today,
+                    choice_prepay_amt=choice_prepay_amt_today,
+                    prev_state=int(prev_state_today) if prev_state_today is not None else None,
+                    next_state=int(next_state_today) if next_state_today is not None else None,
+                    # present value fields
+                    pv_initial_advance_applied=pv_initial_advance_applied,
+                    pv_payment_applied=pv_payment_applied,
+                    pv_prepay_applied=pv_prepay_applied,
+                    pv_advance_applied=pv_advance_applied,
+                    pv_cumulative_collection_agency_remittance=pv_cumulative_collection_agency_remittance,
+                    # debug fields (safe if None)
+                    aged_months=aged,
+                    age_bucket=bucket,
+                    key_used=key_used,
+                    key_hit=key_hit,
+                    rates_sum=rates_sum,
+                )
+            )
+            seen_today.add(L.loan_id)
+
+        d += timedelta(days=1)
+
+    # Month-end balances
+    me_balances = {L.loan_id: L.current_balance for L in loans}
+    return daily_rows, me_balances
+
+## orchestrator
+def load_loans_for_transition(session: Session) -> tuple[list[LoanBase], set[date], list[date]]:
+    # Pull what we need
+    pdf = session.table(T_LOANS).to_pandas()
+    if pdf.empty:
+        return [], set(), []
+
+    # Normalize to UPPER for simple getters
+    pdf.columns = [c.upper() for c in pdf.columns]
+
+    # Compute min/max horizon from raw DF (no dependency on loans list yet)
+    eff_series = pd.to_datetime(pdf["EFFECTIVE_DATE"], errors="coerce").dt.date
+    mat_series = pd.to_datetime(pdf["MATURITY_DATE"],  errors="coerce").dt.date
+    min_eff    = eff_series.min()
+    max_mat    = mat_series.max()
+
+    # Build business-day calendars once
+    bdays_set, bdays_sorted = load_business_days(session, min_eff, max_mat, pad_days=60)
+
+    # IMPORTANT: construct the correct subclass per loan
+    loans = [create_loan_instance(_._asdict(), bdays_set) for _ in pdf.itertuples(index=False)]
+
+    # Provide the sorted calendar to loans that need bisect-based helpers.
+    # Also (re)compute Type3 choice decision dates if the class exposes the method.
+    for L in loans:
+        L.business_days_sorted = bdays_sorted
+        if isinstance(L, Type3Loan) and hasattr(L, "compute_choice_payment_date"):
+            L.compute_choice_payment_date(bdays_sorted)
+
+    return loans, bdays_set, bdays_sorted
+    
+
+def run_forecast(session: Session,
+                 rng_seed: int | None = None,
+                 run_id: str | None = None,
+                 valuation_date: date | None = None
+                ):
+
+    if rng_seed is not None:
+        np.random.seed(rng_seed)
+    run_id = run_id or f"run_{uuid.uuid4().hex[:8]}"
+
+    # Calendars + loans
+    loans, BDAYS_SET, BDAYS_SORTED = load_loans_for_transition(session)
+    if not loans:
+        print("No loans found.")
+        return "No loans."
+
+    # Milestone table (lowercase cols for LoanBase.milestone_dates filters)
+    miles_pdf = session.table(T_MILES).to_pandas()
+    miles_pdf.columns = [c.lower() for c in miles_pdf.columns]
+
+    # Prior month-end balances map
+    prev_me_map = {L.loan_id: L.prev_me_balance for L in loans}
+
+    # Simulation start (month of min effective date)
+    sim_start_month = month_start(min(L.effective_date for L in loans if L.effective_date))
+    # Use caller’s valuation_date if provided; else first day of the simulation
+    val_date = valuation_date or sim_start_month
+
+    # Build discount factors once and create a date->DF lookup
+    disc = build_discount_dict(session, valuation_date=val_date)
+    df_for_date = _df_for_date_factory(disc, valuation_date=val_date)
+
+    # Keep this for “PV initial advance” (only on the very first calendar day we simulate)
+    first_sim_day = val_date
+
+    # Collect all rows, then write once at end
+    all_rows: list[dict] = []
+
+    cur_month = sim_start_month
+    # up to 600 cycles safety
+    for _ in range(600):
+        active = [
+            L for L in loans
+            if (not L.paidoff and not L.cancelled
+                and not (L.charged_off and L.prev_state_eff in TERMINAL_STATES)
+                and cur_month <= L.maturity_date)
+        ]
+        if not active:
+            break
+
+        # One month engine
+        daily_rows, me_balances = run_one_month(
+            active,
+            asof_month_start=cur_month,
+            bdays_sorted=BDAYS_SORTED,
+            prev_me_map=prev_me_map,
+            miles_df=miles_pdf,
+            df_for_date=df_for_date,          # <-- NEW
+            first_sim_day=first_sim_day,      # <-- NEW (for initial-advance PV)        
+        )
+
+        # Accumulate rows
+        if daily_rows:
+            # stamp run_id now so it exists for sanitize if you add it to the output schema later
+            for r in daily_rows:
+                r.setdefault("run_id", run_id)
+            all_rows.extend(daily_rows)
+
+        # Advance clocks
+        prev_me_map.update(me_balances)
+        cur_month = add_months(cur_month, 1)
+        for L in loans:
+            L.months_since_orig += 1
+            if L.prev_state_eff == STATE_CHARGEOFF:
+                L.months_since_co = (L.months_since_co or 0) + 1
+
+    if not all_rows:
+        print("No rows generated.")
+        return "No rows."
+
+    # ----------------------------
+    # Prepare DataFrame for Snowflake
+    # ----------------------------
+    df = pd.DataFrame(all_rows)
+
+    # Map Python keys -> Snowflake column names (UPPER)
+    rename_map = {
+        "loan_id": "LOAN_ID",
+        "date": "DATE",
+        "current_balance": "CURRENT_BALANCE",
+        "accrued_interest": "ACCRUED_INTEREST",
+        "deferred_interest_balance": "DEFERRED_INTEREST_BALANCE",
+        "arrears_amount": "ARREARS_AMOUNT",
+        "total_fees": "TOTAL_FEES",
+        "missed_payments": "MISSED_PAYMENTS",
+        "charged_off": "CHARGED_OFF",
+        "cancelled": "CANCELLED",
+        "paid_in_full": "PAID_IN_FULL",
+        "cancellation_fee": "CANCELLATION_FEE",
+        "expected_payment": "EXPECTED_PAYMENT",
+        "payment_applied": "PAYMENT_APPLIED",
+        "prepay_applied": "PREPAY_APPLIED",  # <- matches your schema name
+        "advance_applied": "ADVANCE_APPLIED",
+        "choice_flag": "CHOICE_FLAG",
+        "choice_prepay_amt": "CHOICE_PREPAY_AMT",
+        "prev_state": "PREV_STATE",
+        "next_state": "NEXT_STATE",
+        "cumulative_collection_agency_remittance": "CUMULATIVE_COLLECTION_AGENCY_REMITTANCE",
+        # present value fields
+        "pv_initial_advance_applied": "PV_INITIAL_ADVANCE_APPLIED",
+        "pv_payment_applied": "PV_PAYMENT_APPLIED",
+        "pv_prepay_applied": "PV_PREPAY_APPLIED",
+        "pv_advance_applied": "PV_ADVANCE_APPLIED",
+        "pv_cumulative_collection_agency_remittance": "PV_CUMULATIVE_COLLECTION_AGENCY_REMITTANCE",      
+        # "run_id": "RUN_ID",  # add if you want it in the table later
+    }
+    df.rename(columns=rename_map, inplace=True)
+
+    # Explicit schema (must match your target table) --this is specificlaly for snowflake
+    schema = StructType([
+        StructField("LOAN_ID", IntegerType()),
+        StructField("DATE", DateType()),
+        StructField("CURRENT_BALANCE", DoubleType()),
+        StructField("ACCRUED_INTEREST", DoubleType()),
+        StructField("DEFERRED_INTEREST_BALANCE", DoubleType()),
+        StructField("ARREARS_AMOUNT", DoubleType()),
+        StructField("TOTAL_FEES", DoubleType()),
+        StructField("MISSED_PAYMENTS", IntegerType()),
+        StructField("CHARGED_OFF", BooleanType()),
+        StructField("CANCELLED", BooleanType()),
+        StructField("PAID_IN_FULL", BooleanType()),
+        StructField("CANCELLATION_FEE", DoubleType()),
+        StructField("EXPECTED_PAYMENT", DoubleType()),
+        StructField("PAYMENT_APPLIED", DoubleType()),
+        StructField("PREPAY_APPLIED", DoubleType()),
+        StructField("ADVANCE_APPLIED", DoubleType()),
+        StructField("CHOICE_FLAG", IntegerType()),
+        StructField("CHOICE_PREPAY_AMT", DoubleType()),
+        StructField("PREV_STATE", IntegerType()),
+        StructField("NEXT_STATE", IntegerType()),
+        StructField("CUMULATIVE_COLLECTION_AGENCY_REMITTANCE", DoubleType()),
+        # If you add RUN_ID to your output table later, include:
+        # StructField("RUN_ID", StringType()),
+        # present values fields
+        StructField("PV_INITIAL_ADVANCE_APPLIED", DoubleType()),
+        StructField("PV_PAYMENT_APPLIED", DoubleType()),
+        StructField("PV_PREPAY_APPLIED", DoubleType()),
+        StructField("PV_ADVANCE_APPLIED", DoubleType()),
+        StructField("PV_CUMULATIVE_COLLECTION_AGENCY_REMITTANCE", DoubleType()),        
+    ])
+
+    # Make sure all required columns exist (create missing as None)
+    for f in [f.name for f in schema]:
+        if f not in df.columns:
+            df[f] = None
+
+    # ---- Sanitize dtypes & nulls before Snowflake
+    # (Use the uppercase names we just applied)
+    df_clean = sanitize_for_snowflake(
+        df,
+        date_cols  = ["DATE"],
+        int_cols   = ["LOAN_ID", "MISSED_PAYMENTS", "CHOICE_FLAG", "PREV_STATE", "NEXT_STATE"],
+        float_cols = ["CURRENT_BALANCE", "ACCRUED_INTEREST", "DEFERRED_INTEREST_BALANCE",
+                      "ARREARS_AMOUNT", "TOTAL_FEES", "CANCELLATION_FEE", "EXPECTED_PAYMENT",
+                      "PAYMENT_APPLIED", "PREPAY_APPLIED", "ADVANCE_APPLIED",
+                      "CHOICE_PREPAY_AMT", "CUMULATIVE_COLLECTION_AGENCY_REMITTANCE"
+                     # PV fields
+                      "PV_INITIAL_ADVANCE_APPLIED", "PV_PAYMENT_APPLIED", "PV_PREPAY_APPLIED",
+                      "PV_ADVANCE_APPLIED", "PV_CUMULATIVE_COLLECTION_AGENCY_REMITTANCE",
+                     ],
+        bool_cols  = ["CHARGED_OFF", "CANCELLED", "PAID_IN_FULL"],
+        str_cols   = [],  # add "RUN_ID" here if you put it in the schema
+    )
+
+    # Order to match schema exactly
+    df_clean = df_clean[[f.name for f in schema]]
+
+    db, sch, tbl = T_OUT_DAILY.split(".")
+    
+    # df_clean already matches the schema & dtypes you defined above.
+    # Use Snowflake's fast writer from pandas -> table (COPY under the hood).
+    # This appends rows; does NOT auto-create or overwrite the table.
+    res = session.write_pandas(
+        df=df_clean,
+        table_name=tbl,
+        database=db,
+        schema=sch,
+        overwrite=False,
+        auto_create_table=False,
+        create_temp_table=False,
+        quote_identifiers=True,   # keeps UPPERCASE column names intact
+    )
+    
+    # Optional: sanity log (rows_loaded available in result dict for some versions)
+    print(f"Wrote {len(df_clean)} rows to {T_OUT_DAILY}")
+    return f"OK: {len(df_clean)} rows -> {T_OUT_DAILY}"
+
+## monte carlo simulation
+#import uuid
+#from datetime import date as _date
+#from snowflake.snowpark.session import Session
+
+# --- Constants (adjust if you keep them elsewhere) ---
+#T_OUT_DAILY = "FUNWORKSPACEDB.DATA_ANALYTICS.FORECAST_DAILY_LOAN_CASHFLOWS"
+#T_LOAN_SNAPSHOT = "FUNWORKSPACEDB.DATA_ANALYTICS.LOAN_DATA"
+T_MC_RESULTS = "FUNWORKSPACEDB.DATA_ANALYTICS.FORECAST_MC_RESULTS"
+
+# Helper: month_start (align with your existing helper)
+# def month_start(d):
+#     return _date(d.year, d.month, 1)
+
+def _get_sim_start_month(session: Session) -> date:
+    # Use the min effective_date from your loan snapshot to mirror run_forecast default
+    row = session.sql(f"""
+        SELECT MIN(effective_date) AS min_dt
+        FROM {T_LOANS}
+        WHERE effective_date IS NOT NULL
+    """).collect()[0]
+    if row["MIN_DT"] is None:
+        raise ValueError("No effective_date found in loan snapshot.")
+    return month_start(row["MIN_DT"])
+
+def _get_loan_count(session: Session) -> int:
+    return session.sql(f"SELECT COUNT(DISTINCT loan_id) AS n FROM {T_LOANS}").collect()[0]["N"]
+
+def _create_or_replace_mc_table(session: Session):
+    session.sql(f"""
+        CREATE OR REPLACE TABLE {T_MC_RESULTS} (
+            RUN_ID STRING,
+            ITER_ID NUMBER,
+            LOAN_ID NUMBER,
+            VALUATION_DATE DATE,
+            PV_INITIAL_ADVANCE_APPLIED NUMBER(36,2),
+            PV_PAYMENT_APPLIED NUMBER(36,2),
+            PV_PREPAY_APPLIED NUMBER(36,2),
+            PV_ADVANCE_APPLIED NUMBER(36,2),
+            PV_CUMULATIVE_COLLECTION_AGENCY_REMITTANCE NUMBER(36,2),
+            PV_TOTAL NUMBER(36,2),
+            LAST_PREV_STATE NUMBER
+        )
+    """).collect()
+
+def _truncate_daily_table(session: Session):
+    session.sql(f"TRUNCATE TABLE {T_OUT_DAILY}").collect()
+
+def _insert_iteration_summary_from_daily(session: Session, *, run_id: str, iter_id: int, valuation_date: date):
+    """
+    Aggregate PV fields by loan_id from the daily table and capture the last PREV_STATE
+    (row with max DATE; tie-break by higher PREV_STATE).
+    Appends rows to the MC results table.
+    """
+    session.sql(f"""
+        INSERT INTO {T_MC_RESULTS} (
+            RUN_ID, ITER_ID, LOAN_ID, VALUATION_DATE,
+            PV_INITIAL_ADVANCE_APPLIED, PV_PAYMENT_APPLIED, PV_PREPAY_APPLIED,
+            PV_ADVANCE_APPLIED, PV_CUMULATIVE_COLLECTION_AGENCY_REMITTANCE,
+            PV_TOTAL, LAST_PREV_STATE
+        )
+        WITH
+        pv AS (
+            SELECT
+                loan_id,
+                SUM(pv_initial_advance_applied) AS pv_initial_advance_applied,
+                SUM(pv_payment_applied)         AS pv_payment_applied,
+                SUM(pv_prepay_applied)          AS pv_prepay_applied,
+                SUM(pv_advance_applied)         AS pv_advance_applied,
+                SUM(pv_cumulative_collection_agency_remittance) AS pv_cumulative_collection_agency_remittance
+            FROM {T_OUT_DAILY}
+            GROUP BY loan_id
+        ),
+        last_state AS (
+            SELECT loan_id, prev_state AS last_prev_state
+            FROM (
+                SELECT
+                    loan_id,
+                    prev_state,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY loan_id
+                        ORDER BY date DESC, prev_state DESC
+                    ) AS rn
+                FROM {T_OUT_DAILY}
+            )
+            WHERE rn = 1
+        )
+        SELECT
+            '{run_id}' AS RUN_ID,
+            {iter_id}  AS ITER_ID,
+            pv.loan_id,
+            TO_DATE('{valuation_date.isoformat()}') AS valuation_date,
+            pv.pv_initial_advance_applied,
+            pv.pv_payment_applied,
+            pv.pv_prepay_applied,
+            pv.pv_advance_applied,
+            pv.pv_cumulative_collection_agency_remittance,
+            /* PV_TOTAL = sum of the five */
+            (pv.pv_initial_advance_applied
+             + pv.pv_payment_applied
+             + pv.pv_prepay_applied
+             + pv.pv_advance_applied
+             + pv.pv_cumulative_collection_agency_remittance) AS pv_total,
+            COALESCE(ls.last_prev_state, NULL) AS last_prev_state
+        FROM pv
+        LEFT JOIN last_state ls
+            ON pv.loan_id = ls.loan_id
+    """).collect()
+
+def run_forecast_mc(session: Session,
+                    iterations: int,
+                    rng_seed: int | None = None,
+                    run_id: str | None = None,
+                    valuation_date: date | None = None):
+    """
+    Monte Carlo wrapper:
+    - Replaces MC results table at job start.
+    - For iter in 1..iterations:
+        - TRUNCATE daily table
+        - Call your run_forecast(session, rng_seed=seed+iter, run_id=<same>, valuation_date=<sim_start_month>)
+        - Aggregate from daily table -> append one row per loan to MC table
+    - Returns a summary dict.
+    """
+    if iterations <= 0:
+        raise ValueError("iterations must be >= 1")
+
+    # One RUN_ID for the entire MC job
+    run_id = run_id or f"run_{uuid.uuid4().hex[:8]}"
+    sim_start = valuation_date or _get_sim_start_month(session)
+    loan_count = _get_loan_count(session)
+
+    print(f"[MC] Starting job RUN_ID={run_id} | iterations={iterations} | loans={loan_count} | valuation_date={sim_start}")
+    _create_or_replace_mc_table(session)
+
+    completed = 0
+    for iter_id in range(1, iterations + 1):
+        # Deterministic per-iteration seed if provided
+        iter_seed = (rng_seed + iter_id) if rng_seed is not None else None
+
+        # Ensure the daily table holds only the current iteration’s paths
+        _truncate_daily_table(session)
+
+        # Run one full forecast iteration -> populates T_OUT_DAILY
+        print(f"[MC] Iteration {iter_id}/{iterations} :: run_forecast(seed={iter_seed}) ...")
+        run_result = run_forecast(
+            session=session,
+            rng_seed=iter_seed,
+            run_id=run_id,
+            valuation_date=sim_start  # mirrors your “use sim_start_month” rule
+        )
+        # Optional: you can print run_result
+
+        # Aggregate from daily -> MC results (append)
+        _insert_iteration_summary_from_daily(
+            session,
+            run_id=run_id,
+            iter_id=iter_id,
+            valuation_date=sim_start
+        )
+
+        # Basic sanity check (optional but helpful)
+        inserted = session.sql(f"""
+            SELECT COUNT(*) AS n
+            FROM {T_MC_RESULTS}
+            WHERE RUN_ID = '{run_id}' AND ITER_ID = {iter_id}
+        """).collect()[0]["N"]
+
+        print(f"[MC] Iteration {iter_id} complete: appended {inserted} rows (expected ≈ {loan_count}).")
+        completed += 1
+
+    total_rows = session.sql(f"SELECT COUNT(*) AS n FROM {T_MC_RESULTS} WHERE RUN_ID = '{run_id}'").collect()[0]["N"]
+    distinct_loans = session.sql(f"SELECT COUNT(DISTINCT loan_id) AS n FROM {T_MC_RESULTS} WHERE RUN_ID = '{run_id}'").collect()[0]["N"]
+
+    print(f"[MC] Done. RUN_ID={run_id} | iterations={iterations} | rows={total_rows} | distinct_loans={distinct_loans}")
+    print(f"[MC] Expectation check: rows should equal loans({loan_count}) × iterations({iterations}) → {loan_count * iterations}")
+
+    return {
+        "run_id": run_id,
+        "iterations": iterations,
+        "valuation_date": sim_start.isoformat(),
+        "loans": loan_count,
+        "rows_in_mc": total_rows,
+        "distinct_loans_in_mc": distinct_loans
+    }
+
+## run the program
+#msg = run_forecast(session, rng_seed=12345)
+#print(msg)
+
+msg = run_forecast_mc(session, iterations=50)
+print(msg)
