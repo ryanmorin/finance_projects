@@ -1,10 +1,21 @@
 # Import python packages
 import streamlit as st
 import pandas as pd
+import polars as pl
 
 from snowflake.snowpark.context import get_active_session
 session = get_active_session()
 
+
+CREATE OR REPLACE FILE FORMAT FUNWORKSPACEDB.DATA_ANALYTICS.PARQUET_DEFAULT
+  TYPE = PARQUET;
+
+drop table if exists  FUNWORKSPACEDB.DATA_ANALYTICS.forecast_mc_audit;
+drop table if exists FUNWORKSPACEDB.DATA_ANALYTICS.forecast_mc_results;
+drop table if exists  FUNWORKSPACEDB.DATA_ANALYTICS.forecast_mc_runs;
+drop table if exists  FUNWORKSPACEDB.DATA_ANALYTICS.forecast_mc_audit_path;
+drop table if exists  FUNWORKSPACEDB.DATA_ANALYTICS.forecast_daily_loan_cashflows;
+drop table if exists  FUNWORKSPACEDB.DATA_ANALYTICS.forecast_daily_loan_cashflows_stg;
 
 CREATE
 OR REPLACE VIEW funworkspacedb.data_analytics.disbursement_sequences AS
@@ -411,6 +422,9 @@ SELECT
     tbal.current_maturity_date AS maturity_date,
     tbal.cancel_date,
     tbal.chargeoff_date,
+    tbal.principal_paid, ---NEW
+    tbal.total_interest_paid AS interest_paid, ---NEW
+    risk.dealer_fee / 100 AS dealer_fee, ---NEW
     CASE
         WHEN tbal.account_code = 'P' THEN tbal.date_paid_off
         ELSE NULL
@@ -655,14 +669,14 @@ FROM
     LEFT JOIN prev_month_balance 
       ON prev_month_balance.mosaic_loan_id = risk.loan_id
 WHERE
-    tbal.effective_date = '2024-03-01'--'2023-04-29' --test
+    tbal.effective_date = '2024-03-01' --test ---> MUST ALIGN YIELD CURVE
   AND tbal.cancel_date IS NULL
   AND tbal.chargeoff_date IS NULL
   AND tbal.current_balance > 0
-  AND tbal.mosaic_loan_id IN (395927,415487) --370007,369865,369880); --test
+  AND tbal.mosaic_loan_id IN (344024,279927,109062,409485,305419) --test
     --WHERE tbal.effective_date = CURRENT_DATE() - 1
 --ORDER BY RANDOM()
---LIMIT 50;
+--LIMIT 3;
 
 --portfolio_metrics_tbl
 /*
@@ -2246,19 +2260,21 @@ CREATE OR REPLACE TABLE FUNWORKSPACEDB.DATA_ANALYTICS.FORECAST_DAILY_LOAN_CASHFL
   next_state                                 number,
   --these fields are needed for the present value cacls
   pv_initial_advance_applied                 NUMBER(36, 2),
+  pv_historical_payment_applied              NUMBER(36, 2),  
   pv_payment_applied                         NUMBER(36, 2),
   pv_prepay_applied                          NUMBER(36, 2),
   pv_advance_applied                         NUMBER(36, 2),
-  pv_cumulative_collection_agency_remittance NUMBER(36, 2)
-  --run_id                                    string
+  pv_cumulative_collection_agency_remittance NUMBER(36, 2),
+  run_id                                     STRING,
+  iter_id                                    STRING   
 );
 
 # --- Imports
+from __future__ import annotations
 import numpy as np
-import pandas as pd
 import calendar
 from datetime import date, datetime, timedelta
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Iterable, Mapping
 from snowflake.snowpark import Session, Row
 from snowflake.snowpark.functions import col
 from snowflake.snowpark.types import (
@@ -2266,9 +2282,13 @@ from snowflake.snowpark.types import (
     IntegerType, StringType, DateType, DoubleType, BooleanType
 )
 from bisect import bisect_left, bisect_right
+from collections import defaultdict
 #from bisect import bisect_right
 import uuid
 import math
+import os
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 # --- tables --> created above
 T_LOANS   = "FUNWORKSPACEDB.DATA_ANALYTICS.LOAN_DATA"
@@ -2276,10 +2296,14 @@ T_TRANS   = "FUNWORKSPACEDB.DATA_ANALYTICS.TRANSITION_RATES_DATA"
 T_SMM     = "FUNWORKSPACEDB.DATA_ANALYTICS.SMM_DATA"
 T_SMM_CO  = "FUNWORKSPACEDB.DATA_ANALYTICS.CHARGE_OFF_SMM_DATA"
 T_MILES   = "FUNWORKSPACEDB.DATA_ANALYTICS.MILESTONE_TIMING_DATA"
+PARQUET_FORMAT_FQN = "FUNWORKSPACEDB.DATA_ANALYTICS.PARQUET_ZSTD"
 
 # ---- Output targets ----
 T_OUT_DAILY  = "FUNWORKSPACEDB.DATA_ANALYTICS.FORECAST_DAILY_LOAN_CASHFLOWS"
 YIELD_CURVE_TBL = "FUNWORKSPACEDB.DATA_ANALYTICS.YIELD_CURVE"  # columns: DATE, RATE (decimal)
+T_MC_RESULTS   = "FUNWORKSPACEDB.DATA_ANALYTICS.FORECAST_MC_RESULTS"
+T_MC_RUNS      = "FUNWORKSPACEDB.DATA_ANALYTICS.FORECAST_MC_RUNS"
+
 
 # --- State codes
 STATE_ACTIVE_0 = 0
@@ -2844,6 +2868,9 @@ class LoanBase:
         self.cancellation_fee          = 0.0
         self.cumulative_collection_agency_remittance = 0.0
         self.principal_advanced_amount = to_float(g("principal_advanced_amount"), 0.0)
+        self.principal_paid = to_float(g("principal_paid"), 0.0) # new 
+        self.interest_paid = to_float(g("interest_paid"), 0.0) # new
+        self.dealer_fee_amount = to_float(g("dealer_fee"), 0.0) * to_float(g("principal_advanced_amount"), 0.0)
 
         # payments
         self.monthly_payment           = to_float(g("current_monthly_payment"), 0.0)
@@ -2990,6 +3017,7 @@ class LoanBase:
                choice_flag=0,
                choice_prepay_amt=0.0,
                pv_initial_advance_applied = 0.0,
+               pv_historical_payment_applied = 0.0,               
                pv_payment_applied = 0.0,
                pv_prepay_applied = 0.0,
                pv_advance_applied = 0.0,
@@ -3031,6 +3059,7 @@ class LoanBase:
             "cumulative_collection_agency_remittance": float(getattr(self, "cumulative_collection_agency_remittance", 0.0)),
             # present value fields
             "pv_initial_advance_applied": float(pv_initial_advance_applied or 0.0),
+            "pv_historical_payment_applied": float(pv_historical_payment_applied or 0.0),            
             "pv_payment_applied": float(pv_payment_applied or 0.0),
             "pv_prepay_applied": float(pv_prepay_applied or 0.0),
             "pv_advance_applied": float(pv_advance_applied or 0.0),
@@ -3235,66 +3264,116 @@ def compute_monthly_pools(loans: list[LoanBase],
 
     return general, state4_map
 
-def run_one_month(loans: list[LoanBase],
-                  asof_month_start: date,
-                  bdays_sorted: list[date],
-                  prev_me_map: dict[int, float],
-                  miles_df: pd.DataFrame,
-                  df_for_date=None,                 # <-- NEW
-                  first_sim_day: date | None = None   # <-- NEW
-                 ):
-    """
-    One row per loan per day.
-    - Between due dates: prev_state = last promoted; next_state = most recently sampled.
-    - On due date: promote pending -> effective; apply cashflows; resample pending using NEXT month's due date.
-    """
-    daily_rows = []
+# -----------------------------
+# External helpers in codebase:
+# - ACTIVE_STATES, TERMINAL_STATES, STATE_CHARGEOFF, STATE_PIF, STATE_CANCEL, STATE_CANCEL_2
+# - CANCEL_FEE, PROB_CHOICE_CONVERSION, CHARGE_OFF_MISSED_PAYMENTS, COLLECTION_RATE
+# - month_end, month_start, add_months, anchor_due_date, compute_monthly_pools, reconcile_flags, freeze_at_chargeoff
+# - _arrears_and_fees_from_missed, _clamp_active
+# - Type3Loan, LoanBase, create_loan_instance, load_business_days
+# - build_discount_dict, _df_for_date_factory
+# - T_LOANS, T_MILES, T_OUT_DAILY, PARQUET_FORMAT_FQN (e.g., FUNWORKSPACEDB.DATA_ANALYTICS.PARQUET_ZSTD)
+# Make sure T_OUT_DAILY has columns RUN_ID STRING and ITER_ID NUMBER for append‑only writes.
+# -----------------------------
 
-    # Helper: tolerate samplers that return int OR (int, debug_tuple)
+def run_one_month(
+    loans: list[LoanBase],
+    asof_month_start: date,
+    bdays_sorted: list[date],
+    prev_me_map: dict[int, float],
+    miles_df,                      # small; pass Pandas DF (we'll keep your class expectations)
+    df_for_date=None,
+    first_sim_day: date | None = None
+):
+    """
+    Behavior‑preserving speed refactor:
+      - Pre‑index milestones by (day -> list of events) to avoid per‑loan scans each day.
+      - Precompute due dates aligned to the loans list (O(1) indexing inside the loop).
+      - Hoist constants & repeated lookups to locals.
+    """
+    # ---- Local aliases to reduce global lookups in the hot loop
+    ACTIVE_STATES_local      = ACTIVE_STATES
+    TERMINAL_STATES_local    = TERMINAL_STATES
+    STATE_CHARGEOFF_local    = STATE_CHARGEOFF
+    STATE_PIF_local          = STATE_PIF
+    STATE_CANCEL_local       = STATE_CANCEL
+    STATE_CANCEL_2_local     = STATE_CANCEL_2
+    CANCEL_FEE_local         = CANCEL_FEE
+    PROB_CHOICE_CONVERSION_l = PROB_CHOICE_CONVERSION
+    CHARGE_OFF_MISSED_LOCAL  = CHARGE_OFF_MISSED_PAYMENTS
+    COLLECTION_RATE_local    = COLLECTION_RATE
+    month_end_local          = month_end
+    month_start_local        = month_start
+    add_months_local         = add_months
+    anchor_due_date_local    = anchor_due_date
+    reconcile_flags_local    = reconcile_flags
+    freeze_at_chargeoff_loc  = freeze_at_chargeoff
+    _arrears_and_fees_local  = _arrears_and_fees_from_missed
+    _clamp_active_local      = _clamp_active
+    Type3Loan_local          = Type3Loan
+
     def _sample_with_dbg(L, prev_state: int, decision_date: date):
         res = sample_next_state_dynamic(L, prev_state, decision_date)
         if isinstance(res, tuple) and len(res) == 2:
             nxt, dbg = res
         else:
-            nxt, dbg = res, (None, None, None, None, None)  # aged, bucket, key, hit, rates_sum
+            nxt, dbg = res, (None, None, None, None, None)
         return int(nxt), dbg
 
-    # Due date for THIS month
-    month_due_date = {
-        L.loan_id: anchor_due_date(L.first_payment_date, asof_month_start, bdays_sorted)
+    # ---- Due date for THIS month aligned to loan order
+    loan_ids = [L.loan_id for L in loans]
+    loan_due_dates = [
+        anchor_due_date_local(L.first_payment_date, asof_month_start, bdays_sorted)
         for L in loans
-    }
+    ]
 
-    # Milestone funding dates
-    miles_when = {L.loan_id: L.milestone_dates(miles_df) for L in loans}
+    # ---- Milestones: pre-index once per month by day
+    miles_when_by_loan = [L.milestone_dates(miles_df) for L in loans]
+    miles_by_day: dict[date, list[tuple[int, int, float]]] = defaultdict(list)
+    for idx, L in enumerate(loans):
+        mdict = miles_when_by_loan[idx]
+        if not mdict:
+            continue
+        for m, md in mdict.items():
+            amt = L.m_disb.get(m, 0.0)
+            if amt and md is not None:
+                miles_by_day[md].append((idx, m, amt))
 
-    # Monthly pools (SMM) using prior month-end balances
-    general_pool, state4_recoveries = compute_monthly_pools(loans, prev_me_map, month_due_date)
+    # ---- Pools (unchanged semantics)
+    general_pool, state4_recoveries = compute_monthly_pools(
+        loans, prev_me_map, {lid: dd for lid, dd in zip(loan_ids, loan_due_dates)}
+    )
 
-    # Pro-rata weights for general pool (eligible = active states 0–3 only)
     weights = {
         L.loan_id: float(prev_me_map.get(L.loan_id, 0.0) or 0.0)
         for L in loans
-        if L.prev_state_eff in ACTIVE_STATES
+        if L.prev_state_eff in ACTIVE_STATES_local
     }
     weight_remaining = sum(weights.values())
 
+    daily_rows = []
     d    = asof_month_start
-    mend = month_end(asof_month_start)
+    mend = month_end_local(asof_month_start)
+
+    df_for_date_local = df_for_date
 
     while d <= mend:
-        seen_today = set()
-        for L in loans:
-            if L.loan_id in seen_today:
-                continue
-            
-            # stop conditions
-            if d > L.maturity_date or L.paidoff or L.cancelled or (L.charged_off and L.prev_state_eff in TERMINAL_STATES):
+        # Apply milestone events scheduled for day d
+        for idx, m, amt in miles_by_day.get(d, ()):  # O(#events today)
+            L = loans[idx]
+            if amt > 0.0 and L.m_disb.get(m, 0.0) > 0.0:
+                L.current_balance += amt
+                L.m_disb[m] = 0.0
+
+        for i, L in enumerate(loans):
+            # stop/skip conditions (unchanged)
+            if d > L.maturity_date or L.paidoff or L.cancelled or (L.charged_off and L.prev_state_eff in TERMINAL_STATES_local):
                 continue
             if d < L.effective_date:
                 continue
 
-            # Per-day scratch
+            apply_pay = L.apply_payment_priority  # cache method
+
             expected_payment = 0.0
             pay_applied = 0.0
             prepay_applied = 0.0
@@ -3302,181 +3381,129 @@ def run_one_month(loans: list[LoanBase],
             choice_flag_today = 0
             choice_prepay_amt_today = 0.0
             collection_agency_remittance_today = 0.0
-            # # present value
-            # pv_initial_advance_applied = 0.0
-            # pv_payment_applied = 0.0
-            # pv_prepay_applied = 0.0
-            # pv_advance_applied = 0.0
-            # pv_cumulative_collection_agency_remittance = 0.0
-            # other itesm
             used_pool_share = False
-
-            # Seed pending on first touch this month (non-terminals)
             seed_dbg = (None, None, None, None, None)
-            if (L.next_state_pending is None) and (L.prev_state_eff not in TERMINAL_STATES):
-                due = month_due_date[L.loan_id]
+
+            # Seed pending for this month (active only)
+            if (L.next_state_pending is None) and (L.prev_state_eff not in TERMINAL_STATES_local):
+                due = loan_due_dates[i]
                 if due is not None:
                     nxt, seed_dbg = _sample_with_dbg(L, L.prev_state_eff, due)
                     L.next_state_pending = nxt
 
-            # Display values for the row (may be updated on due date below)
             prev_state_today = L.prev_state_eff
             next_state_today = L.next_state_pending
 
-            # Milestones (advances) on their business day
-            mdict = miles_when.get(L.loan_id, {})
-            for m, md in mdict.items():
-                if md == d and L.m_disb.get(m, 0.0) > 0:
-                    L.current_balance += L.m_disb[m]
-                    adv_applied += L.m_disb[m]
-                    L.m_disb[m] = 0.0
-
-
-            # Daily accrual
-            # Skip if already CO, or if we will promote to CO today (prevent accrual on CO day)
-            due_today = month_due_date[L.loan_id]
+            # accrual (skip if CO today)
+            due_today = loan_due_dates[i]
             will_charge_off_today = (
-                (due_today is not None) and (d == due_today) and (L.next_state_pending == STATE_CHARGEOFF)
+                (due_today is not None) and (d == due_today) and (L.next_state_pending == STATE_CHARGEOFF_local)
             )
             if not (L.charged_off or will_charge_off_today):
                 L.accrue_daily(d)
 
-            # ---- Due date: promote -> cashflows -> resample for NEXT cycle
-            due_today = month_due_date[L.loan_id]
+            # due-date processing
             if (due_today is not None) and (d == due_today) and (d >= L.first_payment_date):
-
-                # 1) Promote pending -> effective
                 if L.next_state_pending is not None:
                     L.prev_state_eff = L.next_state_pending
-                    # mark first time we hit charge-off
-                    if L.prev_state_eff == STATE_CHARGEOFF and getattr(L, "chargeoff_date", None) is None:
+                    if L.prev_state_eff == STATE_CHARGEOFF_local and getattr(L, "chargeoff_date", None) is None:
                         L.chargeoff_date = d
 
-                # capture D-1 state pair for missed-payment logic
-                prev_dm1 = prev_state_today          # this is L.prev_state_eff before promotion
-                ns_dm1   = L.next_state_pending 
+                prev_dm1 = prev_state_today
+                ns_dm1   = L.next_state_pending
 
-                # Update states for output after promotion
                 prev_state_today = int(L.prev_state_eff)
-                next_state_today = L.next_state_pending  # will be replaced after resample below
+                next_state_today = L.next_state_pending
 
-                # 2) Determine scheduled payment (Type3 choice rule)
+                # Type3 expected payment rule
                 expected_payment = L.monthly_payment
-                if isinstance(L, Type3Loan) and L.is_choice_decision_day(d):
+                if isinstance(L, Type3Loan_local) and L.is_choice_decision_day(d):
                     if L.current_balance <= L.choice_target_amount:
                         expected_payment = L.monthly_payment
                     else:
                         expected_payment = L.standard_monthly_payment
-                        L.monthly_payment = L.standard_monthly_payment  # permanent
+                        L.monthly_payment = L.standard_monthly_payment
 
-                # 3) Cashflows under EFFECTIVE state
-                if L.prev_state_eff in {STATE_CANCEL, STATE_CANCEL_2}:
-                    # Cancelled
+                if L.prev_state_eff in {STATE_CANCEL_local, STATE_CANCEL_2_local}:
                     L.accrued_interest = 0.0
                     L.arrears_amount = 0.0
                     L.deferred_interest_balance = 0.0
-                    L.cancellation_fee = CANCEL_FEE
+                    L.cancellation_fee = CANCEL_FEE_local
                     L.cancelled = True
-                    # terminal: no next cycle
                     L.next_state_pending = None
                     next_state_today = None
 
-                elif L.prev_state_eff == STATE_PIF and not L._hit_pif_once:
-                    # First promotion to PIF => payoff
+                elif L.prev_state_eff == STATE_PIF_local and not L._hit_pif_once:
                     payoff_amt = (
                         max(0.0, L.deferred_interest_balance)
                         + max(0.0, L.arrears_amount)
                         + max(0.0, L.accrued_interest)
                         + max(0.0, L.current_balance)
                     )
-                    prepay_applied = L.apply_payment_priority(payoff_amt)
+                    prepay_applied = apply_pay(payoff_amt)
                     L._hit_pif_once = True
                     L.paidoff = True
                     L.next_state_pending = None
                     next_state_today = None
 
                 else:
-                    # Scheduled payment (states 0–3); state 4 has no scheduled pay
-                    # -------------------------
-                    # Scheduled vs missed logic
-                    # -------------------------
-                    # Use the D-1 pair to determine cure / miss / same.
                     prev = prev_dm1
                     ns   = ns_dm1
-                    
-                    # Fallback if sampler didn't seed pending for some reason:
-                    if ns is None and prev in ACTIVE_STATES:
+                    if ns is None and prev in ACTIVE_STATES_local:
                         ns = prev
-                    
-                    # default: no scheduled pay until decided below
+
                     pay_applied = 0.0
-                    
-                    if (prev in ACTIVE_STATES) and (ns in ACTIVE_STATES):
-                        prev_a = _clamp_active(prev)
-                        ns_a   = _clamp_active(ns)
+
+                    if (prev in ACTIVE_STATES_local) and (ns in ACTIVE_STATES_local):
+                        prev_a = _clamp_active_local(prev)
+                        ns_a   = _clamp_active_local(ns)
                         delta  = ns_a - prev_a
-                    
+
                         if delta > 0:
-                            # --- INCREASE (worse delinquency): no scheduled payment today
-                            L.missed_payments = min(ns_a, CHARGE_OFF_MISSED_PAYMENTS)
-                            base_arrears, fees = _arrears_and_fees_from_missed(L.missed_payments, expected_payment)
+                            L.missed_payments = min(ns_a, CHARGE_OFF_MISSED_LOCAL)
+                            base_arrears, fees = _arrears_and_fees_local(L.missed_payments, expected_payment)
                             L.total_fees     = fees
                             L.arrears_amount = base_arrears + fees
-                    
+
                         elif delta < 0:
-                            # --- DECREASE / cure: apply "cure" + today's scheduled
                             cure = -delta
                             if cure > 0:
-                                pay_applied += L.apply_payment_priority(cure * expected_payment)
-                            pay_applied += L.apply_payment_priority(expected_payment)
-                    
+                                pay_applied += apply_pay(cure * expected_payment)
+                            pay_applied += apply_pay(expected_payment)
                             L.missed_payments = max(ns_a, 0)
-                            base_arrears, fees = _arrears_and_fees_from_missed(L.missed_payments, expected_payment)
+                            base_arrears, fees = _arrears_and_fees_local(L.missed_payments, expected_payment)
                             L.total_fees     = fees
                             L.arrears_amount = base_arrears + fees
-                    
+
                         else:
-                            # --- SAME bucket: apply exactly one scheduled payment
-                            pay_applied += L.apply_payment_priority(expected_payment)
+                            pay_applied += apply_pay(expected_payment)
                             L.missed_payments = ns_a
-                            base_arrears, fees = _arrears_and_fees_from_missed(L.missed_payments, expected_payment)
+                            base_arrears, fees = _arrears_and_fees_local(L.missed_payments, expected_payment)
                             L.total_fees     = fees
                             L.arrears_amount = base_arrears + fees
-                    
-                    elif ns == STATE_CHARGEOFF:
-                        # Transitioning into CO this cycle — cap and freeze
-                        L.missed_payments = CHARGE_OFF_MISSED_PAYMENTS
-                        base_arrears, fees = _arrears_and_fees_from_missed(L.missed_payments, expected_payment)
+
+                    elif ns == STATE_CHARGEOFF_local:
+                        L.missed_payments = CHARGE_OFF_MISSED_LOCAL
+                        base_arrears, fees = _arrears_and_fees_local(L.missed_payments, expected_payment)
                         L.total_fees     = fees
                         L.arrears_amount = base_arrears + fees
-                        freeze_at_chargeoff(L, d)
-                    
-                    elif ns in TERMINAL_STATES:
-                        # PIF / Cancel handled elsewhere
-                        pass
+                        freeze_at_chargeoff_loc(L, d)
 
-                    # Prepayments / Recoveries
-                    if L.prev_state_eff == STATE_CHARGEOFF:
-                        # state-4 recoveries pool
+                    # Prepayments / recoveries
+                    if L.prev_state_eff == STATE_CHARGEOFF_local:
                         L.charged_off = True
                         rec = float(state4_recoveries.get(L.loan_id, 0.0) or 0.0)
                         if rec > 0:
-                            applied = L.apply_payment_priority(rec)
+                            applied = apply_pay(rec)
                             prepay_applied += applied
                             state4_recoveries[L.loan_id] = 0.0
-                            
-                            # compute today's remittance only if some is actually applied
-                            rem_today = applied * COLLECTION_RATE if applied > 0.0 else 0.0
+                            rem_today = applied * COLLECTION_RATE_local if applied > 0.0 else 0.0
                             collection_agency_remittance_today = rem_today
-
-                            # If you truly want to keep a running total on the object as well:
                             prior_cum = float(getattr(L, "cumulative_collection_agency_remittance", 0.0) or 0.0)
                             L.cumulative_collection_agency_remittance = prior_cum + rem_today
-                            
                     else:
-                        # Type3 choice prepay (consumes pool share) on decision due date
-                        if isinstance(L, Type3Loan) and L.is_choice_decision_day(d) and L.is_prepayment_eligible():
-                            if np.random.rand() < PROB_CHOICE_CONVERSION:
+                        if isinstance(L, Type3Loan_local) and L.is_choice_decision_day(d) and L.is_prepayment_eligible():
+                            if np.random.rand() < PROB_CHOICE_CONVERSION_l:
                                 choice_flag_today = 1
                                 L.choice_flag_value = 1
                                 desired = (
@@ -3486,79 +3513,75 @@ def run_one_month(loans: list[LoanBase],
                                     + max(0.0, L.current_balance - L.choice_target_amount)
                                 )
                                 share = 0.0
-                                if general_pool > 0 and L.loan_id in weights and weight_remaining > 0:
-                                    share = general_pool * (weights[L.loan_id] / weight_remaining)
-                                apply_amt = min(desired, share)
-                                if apply_amt > 0:
-                                    applied = L.apply_payment_priority(apply_amt)
+                                w = weights.get(L.loan_id, 0.0)
+                                if general_pool > 0 and w > 0 and weight_remaining > 0:
+                                    share = general_pool * (w / weight_remaining)
+                                if share > 0:
+                                    applied = apply_pay(share)
                                     prepay_applied += applied
                                     choice_prepay_amt_today += applied
                                     general_pool -= applied
-                                if L.loan_id in weights:
-                                    weight_remaining -= weights[L.loan_id]
+                                if w > 0:
+                                    weight_remaining -= w
                                     weights[L.loan_id] = 0.0
                                 used_pool_share = True
                             L.choice_decided = True
 
-                        # Normal pool prepay if not consumed by choice (states 0–3)
-                        if (not used_pool_share) and general_pool > 0 and L.loan_id in weights and weight_remaining > 0 and L.prev_state_eff in ACTIVE_STATES:
-                            share = general_pool * (weights[L.loan_id] / weight_remaining)
-                            if share > 0:
-                                applied = L.apply_payment_priority(share)
-                                prepay_applied += applied
-                                general_pool -= applied
-                            weight_remaining -= weights[L.loan_id]
-                            weights[L.loan_id] = 0.0
-                            used_pool_share = True
+                        if (not used_pool_share) and general_pool > 0 and L.prev_state_eff in ACTIVE_STATES_local:
+                            w = weights.get(L.loan_id, 0.0)
+                            if w > 0 and weight_remaining > 0:
+                                share = general_pool * (w / weight_remaining)
+                                if share > 0:
+                                    applied = apply_pay(share)
+                                    prepay_applied += applied
+                                    general_pool -= applied
+                                weight_remaining -= w
+                                weights[L.loan_id] = 0.0
+                                used_pool_share = True
 
-                    # 4) RESAMPLE pending for the NEXT cycle (only if not terminal today)
-                    if L.prev_state_eff in TERMINAL_STATES:
+                    # Resample next cycle
+                    if L.prev_state_eff in TERMINAL_STATES_local:
                         L.next_state_pending = None
                         next_state_today = None
                     else:
-                        next_month = month_start(add_months(d, 1))
-                        next_due   = anchor_due_date(L.first_payment_date, next_month, bdays_sorted)
+                        next_month = month_start_local(add_months_local(d, 1))
+                        next_due   = anchor_due_date_local(L.first_payment_date, next_month, bdays_sorted)
                         if next_due is not None:
                             nxt, res_dbg = _sample_with_dbg(L, L.prev_state_eff, next_due)
                             L.next_state_pending = nxt
                             next_state_today = nxt
-                            seed_dbg = res_dbg  # overwrite debug with the latest sample
+                            seed_dbg = res_dbg
                         else:
                             L.next_state_pending = None
                             next_state_today = None
 
-            # End-of-day flags
-            reconcile_flags(L)
+            # end-of-day flags
+            reconcile_flags_local(L)
 
             pv_payment_applied = 0.0
             pv_prepay_applied = 0.0
             pv_advance_applied = 0.0
-            pv_cumulative_collection_agency_remittance = 0.0
+            pv_cum_coll = 0.0
 
-            if df_for_date is not None:
-                df = float(df_for_date(d))
-                # Day-by-day PVs per your spec
-                pv_payment_applied = (pay_applied or 0.0) * df
-                pv_prepay_applied  = (prepay_applied or 0.0) * df
-                pv_advance_applied = ((adv_applied or 0.0) * -1.0) * df
-                pv_cumulative_collection_agency_remittance = (collection_agency_remittance_today * -1.0) * df
-    
-                # PV of initial advance only on the very first simulated day
-                # (You described “first day of the simulation”—we key that to first_sim_day)
+            if df_for_date_local is not None:
+                dfv = float(df_for_date_local(d))
+                pv_payment_applied = (pay_applied or 0.0) * dfv
+                pv_prepay_applied  = (prepay_applied or 0.0) * dfv
+                pv_advance_applied = ((adv_applied or 0.0) * -1.0) * dfv
+                pv_cum_coll        = (collection_agency_remittance_today * -1.0) * dfv
+
             pv_initial_advance_applied = 0.0
-
-            if df_for_date is not None:
-                df = float(df_for_date(d))
-            
-                # first simulated day for this specific loan
+            pv_historical_payment_applied = 0.0
+            if df_for_date_local is not None:
+                dfv = float(df_for_date_local(d))
                 first_day_for_L = max(first_sim_day or asof_month_start, L.effective_date)
-            
                 if (not L._pv_initial_done) and (d == first_day_for_L):
-                    pv_initial_advance_applied = ((getattr(L, "principal_advanced_amount", 0.0) or 0.0) * -1.0) * df
+                    pv_initial_advance_applied = (((getattr(L, "principal_advanced_amount", 0.0) or 0.0) * dfv) * -1.0) + ((getattr(L, "dealer_fee_amount", 0.0) or 0.0) * dfv)
+                    pv_historical_payment_applied = ((getattr(L, "principal_paid", 0.0) or 0.0) * dfv) + ((getattr(L, "interest_paid", 0.0) or 0.0) * dfv) 
                     L._pv_initial_done = True
 
-            # Emit one row
             aged, bucket, key_used, key_hit, rates_sum = seed_dbg
+            # NOTE: We keep original record() but you may upper-case later before writing.
             daily_rows.append(
                 L.record(
                     d,
@@ -3570,13 +3593,12 @@ def run_one_month(loans: list[LoanBase],
                     choice_prepay_amt=choice_prepay_amt_today,
                     prev_state=int(prev_state_today) if prev_state_today is not None else None,
                     next_state=int(next_state_today) if next_state_today is not None else None,
-                    # present value fields
                     pv_initial_advance_applied=pv_initial_advance_applied,
+                    pv_historical_payment_applied=pv_historical_payment_applied,                   
                     pv_payment_applied=pv_payment_applied,
                     pv_prepay_applied=pv_prepay_applied,
                     pv_advance_applied=pv_advance_applied,
-                    pv_cumulative_collection_agency_remittance=pv_cumulative_collection_agency_remittance,
-                    # debug fields (safe if None)
+                    pv_cumulative_collection_agency_remittance=pv_cum_coll,
                     aged_months=aged,
                     age_bucket=bucket,
                     key_used=key_used,
@@ -3584,85 +3606,260 @@ def run_one_month(loans: list[LoanBase],
                     rates_sum=rates_sum,
                 )
             )
-            seen_today.add(L.loan_id)
 
         d += timedelta(days=1)
 
-    # Month-end balances
     me_balances = {L.loan_id: L.current_balance for L in loans}
     return daily_rows, me_balances
 
+# ==========================================
+# Block 2 — Orchestrator with Polars inputs + Parquet Chunk Sink + single COPY INTO
+# ==========================================
+# ---- Tiny columnar sink (Arrow/Parquet). Accepts dict rows; writes big, typed chunks.
+class ParquetChunkSink:
+    def __init__(self, out_dir: str, chunk_rows: int = 10_000_000):
+        os.makedirs(out_dir, exist_ok=True)
+        self.out_dir = out_dir
+        self.chunk_rows = chunk_rows
+        self._cols = None
+        self._buffers = None
+        self.files = []
+        self._n = 0
+
+    def _ensure_buffers(self, row: Mapping):
+        if self._cols is None:
+            self._cols = list(row.keys())
+            self._buffers = {c: [] for c in self._cols}
+        else:
+            new_cols = [c for c in row.keys() if c not in self._buffers]
+            if new_cols:
+                for c in new_cols:
+                    self._buffers[c] = [None] * self._n  # backfill existing rows
+                self._cols.extend(new_cols)
+    
+    def write_rows(self, rows: Iterable[Mapping]):
+        for r in rows:
+            self._ensure_buffers(r)
+            for c in self._cols:
+                self._buffers[c].append(r.get(c))   # fill missing values with None
+            self._n += 1
+            if self._n >= self.chunk_rows:
+                self._flush()
+
+    def _flush(self):
+        if not self._n:
+            return
+        arrays = [pa.array(self._buffers[c]) for c in self._cols]
+        table = pa.Table.from_arrays(arrays, names=self._cols)
+        path = os.path.join(self.out_dir, f"part-{uuid.uuid4().hex}.parquet")
+        pq.write_table(table, path, compression="zstd")
+        self.files.append(path)
+        # reset
+        self._buffers = {c: [] for c in self._cols}
+        self._n = 0
+
+    def close(self):
+        self._flush()
+        return self.files
+
+
+CANDIDATE_PREV_ME_COLS = [
+    "PREV_ME_BALANCE",
+    #"PRIOR_ME_BALANCE",
+    #"PREVIOUS_ME_BALANCE",
+    #"PREV_MONTH_END_BALANCE",
+    #"PRIOR_MONTH_END_BALANCE",
+    #"PREV_ME",
+    #"PRIOR_ME",
+    #"PREV_ME_BAL",
+    #"BALANCE_PREV_ME",
+]
+
+def _column_names_upper(session: Session, table_fqn: str) -> set[str]:
+    cols = session.sql(f"DESC TABLE {table_fqn}").collect()
+    return {str(r[0]).upper() for r in cols if r[0] is not None}
+
+def _resolve_prev_me_column(session: Session, table_fqn: str) -> str | None:
+    upper_cols = _column_names_upper(session, table_fqn)
+    for cand in CANDIDATE_PREV_ME_COLS:
+        if cand.upper() in upper_cols:
+            return cand.upper()
+    return None
+
+def snowflake_to_polars_select(session: Session, sql: str) -> pl.DataFrame:
+    df_pd = session.sql(sql).to_pandas()
+    return pl.from_pandas(df_pd)
+
 def load_loans_for_transition(session: Session) -> tuple[list[LoanBase], set[date], list[date]]:
-    # Pull what we need
-    pdf = session.table(T_LOANS).to_pandas()
-    if pdf.empty:
+    # Pull FULL loan snapshot so create_loan_instance gets every needed field
+    pl_loans = snowflake_to_polars_select(session, f"SELECT * FROM {T_LOANS}")
+    if pl_loans.is_empty():
         return [], set(), []
 
-    # Normalize to UPPER for simple getters
-    pdf.columns = [c.upper() for c in pdf.columns]
+    # Uppercase column names (your factory expected upper in the original)
+    pl_loans = pl_loans.rename({c: c.upper() for c in pl_loans.columns})
 
-    # Compute min/max horizon from raw DF (no dependency on loans list yet)
-    eff_series = pd.to_datetime(pdf["EFFECTIVE_DATE"], errors="coerce").dt.date
-    mat_series = pd.to_datetime(pdf["MATURITY_DATE"],  errors="coerce").dt.date
-    min_eff    = eff_series.min()
-    max_mat    = mat_series.max()
+    # Safe, dtype-agnostic date coercions (no .strptime here)
+    for col in ("EFFECTIVE_DATE", "MATURITY_DATE", "FIRST_PAYMENT_DATE"):
+        if col in pl_loans.columns:
+            pl_loans = pl_loans.with_columns(
+                pl.col(col).cast(pl.Date, strict=False)
+            )
 
-    # Build business-day calendars once
+    # Compute min/max horizon (like original)
+    min_eff = pl_loans["EFFECTIVE_DATE"].min() if "EFFECTIVE_DATE" in pl_loans.columns else None
+    max_mat = pl_loans["MATURITY_DATE"].max()  if "MATURITY_DATE"  in pl_loans.columns else None
+    if min_eff is None or max_mat is None:
+        raise ValueError("EFFECTIVE_DATE / MATURITY_DATE missing in loan snapshot.")
+
+    # Business-day calendars
     bdays_set, bdays_sorted = load_business_days(session, min_eff, max_mat, pad_days=60)
 
-    # IMPORTANT: construct the correct subclass per loan
-    loans = [create_loan_instance(_._asdict(), bdays_set) for _ in pdf.itertuples(index=False)]
+    # Build Loan subclasses directly from Polars rows (preserving original keys)
+    loans = [create_loan_instance(row, bdays_set) for row in pl_loans.iter_rows(named=True)]
 
-    # Provide the sorted calendar to loans that need bisect-based helpers.
-    # Also (re)compute Type3 choice decision dates if the class exposes the method.
+    # Provide calendar + recompute choice dates if needed
     for L in loans:
         L.business_days_sorted = bdays_sorted
         if isinstance(L, Type3Loan) and hasattr(L, "compute_choice_payment_date"):
             L.compute_choice_payment_date(bdays_sorted)
 
     return loans, bdays_set, bdays_sorted
-    
 
-def run_forecast(session: Session,
-                 rng_seed: int | None = None,
-                 run_id: str | None = None,
-                 valuation_date: date | None = None
-                ):
 
+def _resolve_any_column(session: Session, table_fqn: str, candidates: list[str]) -> str | None:
+    upper_cols = _column_names_upper(session, table_fqn)
+    for cand in candidates:
+        if cand.upper() in upper_cols:
+            return cand.upper()
+    return None
+
+def load_milestones(session: Session) -> pl.DataFrame:
+    # Candidate names by role
+    LOAN_ID_CANDS = ["LOAN_ID", "LOANID", "ID_LOAN", "ACCOUNT_ID", "ACCT_ID"]
+    NAME_CANDS    = ["MILESTONE", "MILESTONE_NAME", "EVENT", "STEP_NAME"]
+    DATE_CANDS    = ["MILESTONE_DATE", "MILESTONE_DT", "DATE", "EVENT_DATE", "EFFECTIVE_DATE"]
+    AMT_CANDS     = ["AMOUNT", "MILESTONE_AMOUNT", "ADVANCE_AMOUNT", "FUNDING_AMOUNT", "DISBURSEMENT_AMOUNT"]
+
+    loan_id_col = _resolve_any_column(session, T_MILES, LOAN_ID_CANDS)
+    name_col    = _resolve_any_column(session, T_MILES, NAME_CANDS)
+    date_col    = _resolve_any_column(session, T_MILES, DATE_CANDS)
+    amt_col     = _resolve_any_column(session, T_MILES, AMT_CANDS)
+
+    # LOAN_ID and DATE are required for your LoanBase.milestone_dates logic to work
+    if not loan_id_col:
+        raise ValueError(f"{T_MILES} has no recognizable loan id column (tried {LOAN_ID_CANDS}).")
+    if not date_col:
+        raise ValueError(f"{T_MILES} has no recognizable milestone date column (tried {DATE_CANDS}).")
+
+    select_pieces = [
+        f"{loan_id_col} AS loan_id",
+        f"TO_DATE({date_col}) AS milestone_date",
+    ]
+    # Optional columns
+    if name_col:
+        select_pieces.append(f"{name_col} AS milestone")
+    else:
+        select_pieces.append("NULL AS milestone")
+
+    if amt_col:
+        select_pieces.append(f"{amt_col} AS amount")
+    else:
+        select_pieces.append("NULL::FLOAT AS amount")
+
+    sql = f"SELECT {', '.join(select_pieces)} FROM {T_MILES}"
+    pl_miles = snowflake_to_polars_select(session, sql)
+
+    if pl_miles.is_empty():
+        # keep expected schema even if empty
+        return pl.DataFrame({"loan_id": [], "milestone": [], "milestone_date": [], "amount": []})
+
+    # Lowercase to match LoanBase.milestone_dates expectations
+    pl_miles = pl_miles.rename({c: c.lower() for c in pl_miles.columns})
+    return pl_miles
+
+
+# ---- Optional: map lower->UPPER keys before writing to Snowflake (avoid Pandas rename)
+RENAME_TO_UPPER = {
+    "loan_id": "LOAN_ID",
+    "date": "DATE",
+    "current_balance": "CURRENT_BALANCE",
+    "accrued_interest": "ACCRUED_INTEREST",
+    "deferred_interest_balance": "DEFERRED_INTEREST_BALANCE",
+    "arrears_amount": "ARREARS_AMOUNT",
+    "total_fees": "TOTAL_FEES",
+    "missed_payments": "MISSED_PAYMENTS",
+    "charged_off": "CHARGED_OFF",
+    "cancelled": "CANCELLED",
+    "paid_in_full": "PAID_IN_FULL",
+    "cancellation_fee": "CANCELLATION_FEE",
+    "expected_payment": "EXPECTED_PAYMENT",
+    "payment_applied": "PAYMENT_APPLIED",
+    "prepay_applied": "PREPAY_APPLIED",
+    "advance_applied": "ADVANCE_APPLIED",
+    "choice_flag": "CHOICE_FLAG",
+    "choice_prepay_amt": "CHOICE_PREPAY_AMT",
+    "prev_state": "PREV_STATE",
+    "next_state": "NEXT_STATE",
+    "cumulative_collection_agency_remittance": "CUMULATIVE_COLLECTION_AGENCY_REMITTANCE",
+    # PV fields
+    "pv_initial_advance_applied": "PV_INITIAL_ADVANCE_APPLIED",
+    "pv_historical_payment_applied": "PV_HISTORICAL_PAYMENT_APPLIED",    
+    "pv_payment_applied": "PV_PAYMENT_APPLIED",
+    "pv_prepay_applied": "PV_PREPAY_APPLIED",
+    "pv_advance_applied": "PV_ADVANCE_APPLIED",
+    "pv_cumulative_collection_agency_remittance": "PV_CUMULATIVE_COLLECTION_AGENCY_REMITTANCE",
+}
+
+
+def _remap_keys_upper(rows: list[dict]) -> list[dict]:
+    out = []
+    for r in rows:
+        o = {RENAME_TO_UPPER.get(k, k): v for k, v in r.items()}
+        out.append(o)
+    return out
+
+
+# ---- Main orchestrator (stream to Parquet + single COPY INTO)
+
+def run_forecast(
+    session: Session,
+    rng_seed: int | None = None,
+    run_id: str | None = None,
+    valuation_date: date | None = None,
+    iter_id: int | None = None,                 # NEW: stamped into detail for MC append-only
+    out_dir: str = "/tmp/forecast_chunks",
+    chunk_rows: int = 10_000_000,
+    parquet_format_fqn: str = None              # Provide PARQUET_FORMAT_FQN or pass in here
+):
     if rng_seed is not None:
         np.random.seed(rng_seed)
     run_id = run_id or f"run_{uuid.uuid4().hex[:8]}"
+    if parquet_format_fqn is None:
+        parquet_format_fqn = PARQUET_FORMAT_FQN
 
-    # Calendars + loans
     loans, BDAYS_SET, BDAYS_SORTED = load_loans_for_transition(session)
     if not loans:
         print("No loans found.")
         return "No loans."
 
-    # Milestone table (lowercase cols for LoanBase.milestone_dates filters)
+    #pl_miles = load_milestones(session)
+    #miles_pdf = pl_miles.to_pandas()  # small; compatible with your LoanBase.milestone_dates
+
     miles_pdf = session.table(T_MILES).to_pandas()
     miles_pdf.columns = [c.lower() for c in miles_pdf.columns]
-
-    # Prior month-end balances map
+    
     prev_me_map = {L.loan_id: L.prev_me_balance for L in loans}
-
-    # Simulation start (month of min effective date)
     sim_start_month = month_start(min(L.effective_date for L in loans if L.effective_date))
-    # Use caller’s valuation_date if provided; else first day of the simulation
     val_date = valuation_date or sim_start_month
 
-    # Build discount factors once and create a date->DF lookup
     disc = build_discount_dict(session, valuation_date=val_date)
     df_for_date = _df_for_date_factory(disc, valuation_date=val_date)
-
-    # Keep this for “PV initial advance” (only on the very first calendar day we simulate)
     first_sim_day = val_date
 
-    # Collect all rows, then write once at end
-    all_rows: list[dict] = []
+    sink = ParquetChunkSink(out_dir=out_dir, chunk_rows=chunk_rows)
 
     cur_month = sim_start_month
-    # up to 600 cycles safety
     for _ in range(600):
         active = [
             L for L in loans
@@ -3673,25 +3870,26 @@ def run_forecast(session: Session,
         if not active:
             break
 
-        # One month engine
         daily_rows, me_balances = run_one_month(
             active,
             asof_month_start=cur_month,
             bdays_sorted=BDAYS_SORTED,
             prev_me_map=prev_me_map,
             miles_df=miles_pdf,
-            df_for_date=df_for_date,          # <-- NEW
-            first_sim_day=first_sim_day,      # <-- NEW (for initial-advance PV)        
+            df_for_date=df_for_date,
+            first_sim_day=first_sim_day,
         )
 
-        # Accumulate rows
         if daily_rows:
-            # stamp run_id now so it exists for sanitize if you add it to the output schema later
+            #print("DEBUG first row:", daily_rows[0])
+            #print("DEBUG keys:", sorted(daily_rows[0].keys()))
+            # stamp IDs for append‑only, then upper‑case keys for Snowflake schema
             for r in daily_rows:
-                r.setdefault("run_id", run_id)
-            all_rows.extend(daily_rows)
+                r.setdefault("RUN_ID", run_id)
+                if iter_id is not None:
+                    r.setdefault("ITER_ID", iter_id)
+            sink.write_rows(_remap_keys_upper(daily_rows))
 
-        # Advance clocks
         prev_me_map.update(me_balances)
         cur_month = add_months(cur_month, 1)
         for L in loans:
@@ -3699,142 +3897,30 @@ def run_forecast(session: Session,
             if L.prev_state_eff == STATE_CHARGEOFF:
                 L.months_since_co = (L.months_since_co or 0) + 1
 
-    if not all_rows:
+    paths = sink.close()
+    if not paths:
         print("No rows generated.")
         return "No rows."
 
-    # ----------------------------
-    # Prepare DataFrame for Snowflake
-    # ----------------------------
-    df = pd.DataFrame(all_rows)
+    stage = "@~/forecast_chunks"
+    for p in paths:
+        session.file.put(p, stage, auto_compress=False, overwrite=True)
 
-    # Map Python keys -> Snowflake column names (UPPER)
-    rename_map = {
-        "loan_id": "LOAN_ID",
-        "date": "DATE",
-        "current_balance": "CURRENT_BALANCE",
-        "accrued_interest": "ACCRUED_INTEREST",
-        "deferred_interest_balance": "DEFERRED_INTEREST_BALANCE",
-        "arrears_amount": "ARREARS_AMOUNT",
-        "total_fees": "TOTAL_FEES",
-        "missed_payments": "MISSED_PAYMENTS",
-        "charged_off": "CHARGED_OFF",
-        "cancelled": "CANCELLED",
-        "paid_in_full": "PAID_IN_FULL",
-        "cancellation_fee": "CANCELLATION_FEE",
-        "expected_payment": "EXPECTED_PAYMENT",
-        "payment_applied": "PAYMENT_APPLIED",
-        "prepay_applied": "PREPAY_APPLIED",  # <- matches your schema name
-        "advance_applied": "ADVANCE_APPLIED",
-        "choice_flag": "CHOICE_FLAG",
-        "choice_prepay_amt": "CHOICE_PREPAY_AMT",
-        "prev_state": "PREV_STATE",
-        "next_state": "NEXT_STATE",
-        "cumulative_collection_agency_remittance": "CUMULATIVE_COLLECTION_AGENCY_REMITTANCE",
-        # present value fields
-        "pv_initial_advance_applied": "PV_INITIAL_ADVANCE_APPLIED",
-        "pv_payment_applied": "PV_PAYMENT_APPLIED",
-        "pv_prepay_applied": "PV_PREPAY_APPLIED",
-        "pv_advance_applied": "PV_ADVANCE_APPLIED",
-        "pv_cumulative_collection_agency_remittance": "PV_CUMULATIVE_COLLECTION_AGENCY_REMITTANCE",      
-        # "run_id": "RUN_ID",  # add if you want it in the table later
-    }
-    df.rename(columns=rename_map, inplace=True)
+    copy_sql = f"""
+    COPY INTO {T_OUT_DAILY}
+    FROM {stage}
+    FILE_FORMAT = (FORMAT_NAME = {parquet_format_fqn})
+    MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE
+    """
+    session.sql(copy_sql).collect()
 
-    # Explicit schema (must match your target table) --this is specificlaly for snowflake
-    schema = StructType([
-        StructField("LOAN_ID", IntegerType()),
-        StructField("DATE", DateType()),
-        StructField("CURRENT_BALANCE", DoubleType()),
-        StructField("ACCRUED_INTEREST", DoubleType()),
-        StructField("DEFERRED_INTEREST_BALANCE", DoubleType()),
-        StructField("ARREARS_AMOUNT", DoubleType()),
-        StructField("TOTAL_FEES", DoubleType()),
-        StructField("MISSED_PAYMENTS", IntegerType()),
-        StructField("CHARGED_OFF", BooleanType()),
-        StructField("CANCELLED", BooleanType()),
-        StructField("PAID_IN_FULL", BooleanType()),
-        StructField("CANCELLATION_FEE", DoubleType()),
-        StructField("EXPECTED_PAYMENT", DoubleType()),
-        StructField("PAYMENT_APPLIED", DoubleType()),
-        StructField("PREPAY_APPLIED", DoubleType()),
-        StructField("ADVANCE_APPLIED", DoubleType()),
-        StructField("CHOICE_FLAG", IntegerType()),
-        StructField("CHOICE_PREPAY_AMT", DoubleType()),
-        StructField("PREV_STATE", IntegerType()),
-        StructField("NEXT_STATE", IntegerType()),
-        StructField("CUMULATIVE_COLLECTION_AGENCY_REMITTANCE", DoubleType()),
-        # If you add RUN_ID to your output table later, include:
-        # StructField("RUN_ID", StringType()),
-        # present values fields
-        StructField("PV_INITIAL_ADVANCE_APPLIED", DoubleType()),
-        StructField("PV_PAYMENT_APPLIED", DoubleType()),
-        StructField("PV_PREPAY_APPLIED", DoubleType()),
-        StructField("PV_ADVANCE_APPLIED", DoubleType()),
-        StructField("PV_CUMULATIVE_COLLECTION_AGENCY_REMITTANCE", DoubleType()),        
-    ])
+    return f"OK: {len(paths)} parquet parts -> {T_OUT_DAILY}"
 
-    # Make sure all required columns exist (create missing as None)
-    for f in [f.name for f in schema]:
-        if f not in df.columns:
-            df[f] = None
-
-    # ---- Sanitize dtypes & nulls before Snowflake
-    # (Use the uppercase names we just applied)
-    df_clean = sanitize_for_snowflake(
-        df,
-        date_cols  = ["DATE"],
-        int_cols   = ["LOAN_ID", "MISSED_PAYMENTS", "CHOICE_FLAG", "PREV_STATE", "NEXT_STATE"],
-        float_cols = ["CURRENT_BALANCE", "ACCRUED_INTEREST", "DEFERRED_INTEREST_BALANCE",
-                      "ARREARS_AMOUNT", "TOTAL_FEES", "CANCELLATION_FEE", "EXPECTED_PAYMENT",
-                      "PAYMENT_APPLIED", "PREPAY_APPLIED", "ADVANCE_APPLIED",
-                      "CHOICE_PREPAY_AMT", "CUMULATIVE_COLLECTION_AGENCY_REMITTANCE"
-                     # PV fields
-                      "PV_INITIAL_ADVANCE_APPLIED", "PV_PAYMENT_APPLIED", "PV_PREPAY_APPLIED",
-                      "PV_ADVANCE_APPLIED", "PV_CUMULATIVE_COLLECTION_AGENCY_REMITTANCE",
-                     ],
-        bool_cols  = ["CHARGED_OFF", "CANCELLED", "PAID_IN_FULL"],
-        str_cols   = [],  # add "RUN_ID" here if you put it in the schema
-    )
-
-    # Order to match schema exactly
-    df_clean = df_clean[[f.name for f in schema]]
-
-    db, sch, tbl = T_OUT_DAILY.split(".")
-    
-    # df_clean already matches the schema & dtypes you defined above.
-    # Use Snowflake's fast writer from pandas -> table (COPY under the hood).
-    # This appends rows; does NOT auto-create or overwrite the table.
-    res = session.write_pandas(
-        df=df_clean,
-        table_name=tbl,
-        database=db,
-        schema=sch,
-        overwrite=False,
-        auto_create_table=False,
-        create_temp_table=False,
-        quote_identifiers=True,   # keeps UPPERCASE column names intact
-    )
-    
-    # Optional: sanity log (rows_loaded available in result dict for some versions)
-    print(f"Wrote {len(df_clean)} rows to {T_OUT_DAILY}")
-    return f"OK: {len(df_clean)} rows -> {T_OUT_DAILY}"                
-
-#import uuid
-#from datetime import date as _date
-#from snowflake.snowpark.session import Session
-
-# --- Constants (adjust if you keep them elsewhere) ---
-#T_OUT_DAILY = "FUNWORKSPACEDB.DATA_ANALYTICS.FORECAST_DAILY_LOAN_CASHFLOWS"
-#T_LOAN_SNAPSHOT = "FUNWORKSPACEDB.DATA_ANALYTICS.LOAN_DATA"
-T_MC_RESULTS = "FUNWORKSPACEDB.DATA_ANALYTICS.FORECAST_MC_RESULTS"
-
-# Helper: month_start (align with your existing helper)
-# def month_start(d):
-#     return _date(d.year, d.month, 1)
+# ==========================================
+# Block 3 — Monte Carlo wrapper (append-only) + replay helper (deduped)
+# ==========================================
 
 def _get_sim_start_month(session: Session) -> date:
-    # Use the min effective_date from your loan snapshot to mirror run_forecast default
     row = session.sql(f"""
         SELECT MIN(effective_date) AS min_dt
         FROM {T_LOANS}
@@ -3844,52 +3930,69 @@ def _get_sim_start_month(session: Session) -> date:
         raise ValueError("No effective_date found in loan snapshot.")
     return month_start(row["MIN_DT"])
 
+
 def _get_loan_count(session: Session) -> int:
     return session.sql(f"SELECT COUNT(DISTINCT loan_id) AS n FROM {T_LOANS}").collect()[0]["N"]
 
-def _create_or_replace_mc_table(session: Session):
+
+def _create_mc_results_if_needed(session: Session):
     session.sql(f"""
-        CREATE OR REPLACE TABLE {T_MC_RESULTS} (
-            RUN_ID STRING,
-            ITER_ID NUMBER,
-            LOAN_ID NUMBER,
-            VALUATION_DATE DATE,
-            PV_INITIAL_ADVANCE_APPLIED NUMBER(36,2),
-            PV_PAYMENT_APPLIED NUMBER(36,2),
-            PV_PREPAY_APPLIED NUMBER(36,2),
-            PV_ADVANCE_APPLIED NUMBER(36,2),
+        CREATE TABLE IF NOT EXISTS {T_MC_RESULTS} (
+            RUN_ID                                     STRING,
+            ITER_ID                                    NUMBER,
+            LOAN_ID                                    NUMBER,
+            VALUATION_DATE                             DATE,
+            PV_INITIAL_ADVANCE_APPLIED                 NUMBER(36,2),
+            PV_HISTORICAL_PAYMENT_APPLIED              NUMBER(36,2),
+            PV_PAYMENT_APPLIED                         NUMBER(36,2),
+            PV_PREPAY_APPLIED                          NUMBER(36,2),
+            PV_ADVANCE_APPLIED                         NUMBER(36,2),
             PV_CUMULATIVE_COLLECTION_AGENCY_REMITTANCE NUMBER(36,2),
-            PV_TOTAL NUMBER(36,2),
-            LAST_PREV_STATE NUMBER
+            PV_TOTAL                                   NUMBER(36,2),
+            LAST_PREV_STATE                            NUMBER
         )
     """).collect()
 
-def _truncate_daily_table(session: Session):
-    session.sql(f"TRUNCATE TABLE {T_OUT_DAILY}").collect()
+
+def _create_mc_runs_if_needed(session: Session):
+    session.sql(f"""
+        CREATE TABLE IF NOT EXISTS {T_MC_RUNS} (
+            RUN_ID       STRING,
+            ITER_ID      NUMBER,
+            RNG_SEED     NUMBER,
+            VALUATION_DATE DATE,
+            CREATED_AT   TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+        )
+    """).collect()
+
 
 def _insert_iteration_summary_from_daily(session: Session, *, run_id: str, iter_id: int, valuation_date: date):
     """
-    Aggregate PV fields by loan_id from the daily table and capture the last PREV_STATE
-    (row with max DATE; tie-break by higher PREV_STATE).
-    Appends rows to the MC results table.
+    Aggregate PV fields by loan_id from the daily table and capture last PREV_STATE.
+    Expects T_OUT_DAILY to contain RUN_ID and ITER_ID.
     """
     session.sql(f"""
         INSERT INTO {T_MC_RESULTS} (
             RUN_ID, ITER_ID, LOAN_ID, VALUATION_DATE,
-            PV_INITIAL_ADVANCE_APPLIED, PV_PAYMENT_APPLIED, PV_PREPAY_APPLIED,
+            PV_INITIAL_ADVANCE_APPLIED, PV_HISTORICAL_PAYMENT_APPLIED, PV_PAYMENT_APPLIED, PV_PREPAY_APPLIED,
             PV_ADVANCE_APPLIED, PV_CUMULATIVE_COLLECTION_AGENCY_REMITTANCE,
             PV_TOTAL, LAST_PREV_STATE
         )
-        WITH
+        WITH d AS (
+          SELECT *
+          FROM {T_OUT_DAILY}
+          WHERE RUN_ID = '{run_id}' AND ITER_ID = {iter_id}
+        ),
         pv AS (
             SELECT
                 loan_id,
-                SUM(pv_initial_advance_applied) AS pv_initial_advance_applied,
-                SUM(pv_payment_applied)         AS pv_payment_applied,
-                SUM(pv_prepay_applied)          AS pv_prepay_applied,
-                SUM(pv_advance_applied)         AS pv_advance_applied,
+                SUM(pv_initial_advance_applied)                 AS pv_initial_advance_applied,
+                SUM(pv_historical_payment_applied)              AS pv_historical_payment_applied,
+                SUM(pv_payment_applied)                         AS pv_payment_applied,
+                SUM(pv_prepay_applied)                          AS pv_prepay_applied,
+                SUM(pv_advance_applied)                         AS pv_advance_applied,
                 SUM(pv_cumulative_collection_agency_remittance) AS pv_cumulative_collection_agency_remittance
-            FROM {T_OUT_DAILY}
+            FROM d
             GROUP BY loan_id
         ),
         last_state AS (
@@ -3902,7 +4005,7 @@ def _insert_iteration_summary_from_daily(session: Session, *, run_id: str, iter_
                         PARTITION BY loan_id
                         ORDER BY date DESC, prev_state DESC
                     ) AS rn
-                FROM {T_OUT_DAILY}
+                FROM d
             )
             WHERE rn = 1
         )
@@ -3912,12 +4015,13 @@ def _insert_iteration_summary_from_daily(session: Session, *, run_id: str, iter_
             pv.loan_id,
             TO_DATE('{valuation_date.isoformat()}') AS valuation_date,
             pv.pv_initial_advance_applied,
+            pv.pv_historical_payment_applied,
             pv.pv_payment_applied,
             pv.pv_prepay_applied,
             pv.pv_advance_applied,
             pv.pv_cumulative_collection_agency_remittance,
-            /* PV_TOTAL = sum of the five */
             (pv.pv_initial_advance_applied
+             + pv.pv_historical_payment_applied
              + pv.pv_payment_applied
              + pv.pv_prepay_applied
              + pv.pv_advance_applied
@@ -3928,50 +4032,48 @@ def _insert_iteration_summary_from_daily(session: Session, *, run_id: str, iter_
             ON pv.loan_id = ls.loan_id
     """).collect()
 
+
 def run_forecast_mc(session: Session,
                     iterations: int,
                     rng_seed: int | None = None,
                     run_id: str | None = None,
-                    valuation_date: date | None = None):
+                    valuation_date: date | None = None,
+                    parquet_format_fqn: str | None = None):
     """
-    Monte Carlo wrapper:
-    - Replaces MC results table at job start.
-    - For iter in 1..iterations:
-        - TRUNCATE daily table
-        - Call your run_forecast(session, rng_seed=seed+iter, run_id=<same>, valuation_date=<sim_start_month>)
-        - Aggregate from daily table -> append one row per loan to MC table
-    - Returns a summary dict.
+    Monte Carlo wrapper (append-only, seed-replayable):
+      - Ensures results and runs-ledger tables exist.
+      - For each iter:
+          - Derive deterministic seed if base rng_seed is given.
+          - Call run_forecast(..., iter_id=iter_id, parquet_format_fqn=parquet_format_fqn)
+            — detail rows stamped with RUN_ID & ITER_ID.
+          - Aggregate detail → MC results for (RUN_ID, ITER_ID).
+          - Log (RUN_ID, ITER_ID, RNG_SEED, VALUATION_DATE) in T_MC_RUNS for replay.
     """
     if iterations <= 0:
         raise ValueError("iterations must be >= 1")
 
-    # One RUN_ID for the entire MC job
+    _create_mc_results_if_needed(session)
+    _create_mc_runs_if_needed(session)
+
     run_id = run_id or f"run_{uuid.uuid4().hex[:8]}"
     sim_start = valuation_date or _get_sim_start_month(session)
     loan_count = _get_loan_count(session)
 
-    print(f"[MC] Starting job RUN_ID={run_id} | iterations={iterations} | loans={loan_count} | valuation_date={sim_start}")
-    _create_or_replace_mc_table(session)
+    print(f"[MC] RUN_ID={run_id} | iterations={iterations} | loans={loan_count} | valuation_date={sim_start}")
 
-    completed = 0
     for iter_id in range(1, iterations + 1):
-        # Deterministic per-iteration seed if provided
         iter_seed = (rng_seed + iter_id) if rng_seed is not None else None
-
-        # Ensure the daily table holds only the current iteration’s paths
-        _truncate_daily_table(session)
-
-        # Run one full forecast iteration -> populates T_OUT_DAILY
         print(f"[MC] Iteration {iter_id}/{iterations} :: run_forecast(seed={iter_seed}) ...")
-        run_result = run_forecast(
+
+        _ = run_forecast(
             session=session,
             rng_seed=iter_seed,
             run_id=run_id,
-            valuation_date=sim_start  # mirrors your “use sim_start_month” rule
+            valuation_date=sim_start,
+            iter_id=iter_id,
+            parquet_format_fqn=parquet_format_fqn,
         )
-        # Optional: you can print run_result
 
-        # Aggregate from daily -> MC results (append)
         _insert_iteration_summary_from_daily(
             session,
             run_id=run_id,
@@ -3979,21 +4081,23 @@ def run_forecast_mc(session: Session,
             valuation_date=sim_start
         )
 
-        # Basic sanity check (optional but helpful)
+        session.sql(f"""
+            INSERT INTO {T_MC_RUNS} (RUN_ID, ITER_ID, RNG_SEED, VALUATION_DATE)
+            VALUES ('{run_id}', {iter_id}, {('NULL' if iter_seed is None else iter_seed)}, '{sim_start.isoformat()}')
+        """).collect()
+
         inserted = session.sql(f"""
             SELECT COUNT(*) AS n
             FROM {T_MC_RESULTS}
             WHERE RUN_ID = '{run_id}' AND ITER_ID = {iter_id}
         """).collect()[0]["N"]
-
-        print(f"[MC] Iteration {iter_id} complete: appended {inserted} rows (expected ≈ {loan_count}).")
-        completed += 1
+        print(f"[MC] Iteration {iter_id} done: appended {inserted} rows (expected ≈ {loan_count}).")
 
     total_rows = session.sql(f"SELECT COUNT(*) AS n FROM {T_MC_RESULTS} WHERE RUN_ID = '{run_id}'").collect()[0]["N"]
     distinct_loans = session.sql(f"SELECT COUNT(DISTINCT loan_id) AS n FROM {T_MC_RESULTS} WHERE RUN_ID = '{run_id}'").collect()[0]["N"]
 
     print(f"[MC] Done. RUN_ID={run_id} | iterations={iterations} | rows={total_rows} | distinct_loans={distinct_loans}")
-    print(f"[MC] Expectation check: rows should equal loans({loan_count}) × iterations({iterations}) → {loan_count * iterations}")
+    print(f"[MC] Expect rows ≈ loans({loan_count}) × iterations({iterations}) → {loan_count * iterations}")
 
     return {
         "run_id": run_id,
@@ -4004,10 +4108,43 @@ def run_forecast_mc(session: Session,
         "distinct_loans_in_mc": distinct_loans
     }
 
-#mc_seed_num = 12362 # ----> CHANGE ME!
-#msg = run_forecast(session, rng_seed=mc_seed_num-1)
-#print(msg)
 
-msg = run_forecast_mc(session, iterations=25, rng_seed=12345)
+def replay_iteration(session: Session, run_id: str, iter_id: int, parquet_format_fqn: str | None = None):
+    """
+    Replay a specific iteration's detail using the original seed and valuation_date.
+    Writes to a fresh RUN_ID to keep prior results intact.
+    """
+    rec = session.sql(
+        f"SELECT RNG_SEED, VALUATION_DATE FROM {T_MC_RUNS} WHERE RUN_ID='{run_id}' AND ITER_ID={iter_id}"
+    ).collect()[0]
+    seed = rec["RNG_SEED"]
+    val  = rec["VALUATION_DATE"]
+    return run_forecast(
+        session,
+        rng_seed=seed,
+        run_id=f"{run_id}_replay_{iter_id}",
+        valuation_date=val,
+        iter_id=1,
+        parquet_format_fqn=parquet_format_fqn,
+    )
+
+## 1) (once) create a simple PARQUET file format in Snowflake:
+# CREATE OR REPLACE FILE FORMAT FUNWORKSPACEDB.DATA_ANALYTICS.PARQUET_DEFAULT TYPE=PARQUET;
+
+## 2) run MC with the format name:
+msg = run_forecast_mc(
+    session,
+    iterations=10,  ## ----- CHANGE ME ----- ##
+    rng_seed=12345,
+    parquet_format_fqn="FUNWORKSPACEDB.DATA_ANALYTICS.PARQUET_DEFAULT",
+)
 print(msg)
+
+##3) replay a specific iteration with the same format:
+# replay_iteration(
+#     session,
+#     run_id="run_596b9849",   # your run id
+#     iter_id=9,
+#     parquet_format_fqn="FUNWORKSPACEDB.DATA_ANALYTICS.PARQUET_DEFAULT",
+# )
 
